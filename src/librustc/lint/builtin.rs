@@ -216,6 +216,18 @@ declare_lint! {
     "detects use of deprecated items"
 }
 
+declare_lint! {
+    pub UNUSED_UNSAFE,
+    Warn,
+    "unnecessary use of an `unsafe` block"
+}
+
+declare_lint! {
+    pub UNUSED_MUT,
+    Warn,
+    "detect mut variables which don't need to be mutable"
+}
+
 /// Does nothing as a lint pass, but registers some `Lint`s
 /// which are used by other parts of the compiler.
 #[derive(Copy, Clone)]
@@ -256,7 +268,9 @@ impl LintPass for HardwiredLints {
             MISSING_FRAGMENT_SPECIFIER,
             PARENTHESIZED_PARAMS_IN_TYPES_AND_MODULES,
             LATE_BOUND_LIFETIME_ARGUMENTS,
-            DEPRECATED
+            DEPRECATED,
+            UNUSED_UNSAFE,
+            UNUSED_MUT
         )
     }
 }

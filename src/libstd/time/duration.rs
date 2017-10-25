@@ -13,7 +13,9 @@ use ops::{Add, Sub, Mul, Div, AddAssign, SubAssign, MulAssign, DivAssign};
 
 const NANOS_PER_SEC: u32 = 1_000_000_000;
 const NANOS_PER_MILLI: u32 = 1_000_000;
+const NANOS_PER_MICRO: u32 = 1_000;
 const MILLIS_PER_SEC: u64 = 1_000;
+const MICROS_PER_SEC: u64 = 1_000_000;
 
 /// A `Duration` type to represent a span of time, typically used for system
 /// timeouts.
@@ -116,6 +118,27 @@ impl Duration {
         Duration { secs: secs, nanos: nanos }
     }
 
+    /// Creates a new `Duration` from the specified number of microseconds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(duration_from_micros)]
+    /// use std::time::Duration;
+    ///
+    /// let duration = Duration::from_micros(1_000_002);
+    ///
+    /// assert_eq!(1, duration.as_secs());
+    /// assert_eq!(2000, duration.subsec_nanos());
+    /// ```
+    #[unstable(feature = "duration_from_micros", issue = "44400")]
+    #[inline]
+    pub fn from_micros(micros: u64) -> Duration {
+        let secs = micros / MICROS_PER_SEC;
+        let nanos = ((micros % MICROS_PER_SEC) as u32) * NANOS_PER_MICRO;
+        Duration { secs: secs, nanos: nanos }
+    }
+
     /// Returns the number of _whole_ seconds contained by this `Duration`.
     ///
     /// The returned value does not include the fractional (nanosecond) part of the
@@ -197,8 +220,8 @@ impl Duration {
             }
             debug_assert!(nanos < NANOS_PER_SEC);
             Some(Duration {
-                secs: secs,
-                nanos: nanos,
+                secs,
+                nanos,
             })
         } else {
             None
@@ -268,8 +291,8 @@ impl Duration {
             .and_then(|s| s.checked_add(extra_secs)) {
             debug_assert!(nanos < NANOS_PER_SEC);
             Some(Duration {
-                secs: secs,
-                nanos: nanos,
+                secs,
+                nanos,
             })
         } else {
             None

@@ -13,7 +13,6 @@
 extern crate filetime;
 
 use std::fs::File;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::{fs, env};
@@ -36,55 +35,97 @@ macro_rules! t {
     })
 }
 
-pub fn run(cmd: &mut Command) {
-    println!("running: {:?}", cmd);
-    run_silent(cmd);
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub enum BuildExpectation {
+    Succeeding,
+    Failing,
+    None,
 }
 
-pub fn run_silent(cmd: &mut Command) {
-    if !try_run_silent(cmd) {
+pub fn run(cmd: &mut Command, expect: BuildExpectation) {
+    println!("running: {:?}", cmd);
+    run_silent(cmd, expect);
+}
+
+pub fn run_silent(cmd: &mut Command, expect: BuildExpectation) {
+    if !try_run_silent(cmd, expect) {
         std::process::exit(1);
     }
 }
 
-pub fn try_run_silent(cmd: &mut Command) -> bool {
+pub fn try_run_silent(cmd: &mut Command, expect: BuildExpectation) -> bool {
     let status = match cmd.status() {
         Ok(status) => status,
         Err(e) => fail(&format!("failed to execute command: {:?}\nerror: {}",
                                 cmd, e)),
     };
-    if !status.success() {
-        println!("\n\ncommand did not execute successfully: {:?}\n\
-                  expected success, got: {}\n\n",
-                 cmd,
-                 status);
-    }
-    status.success()
+    process_status(
+        cmd,
+        status.success(),
+        expect,
+        || println!("\n\ncommand did not execute successfully: {:?}\n\
+                    expected success, got: {}\n\n",
+                    cmd,
+                    status))
 }
 
-pub fn run_suppressed(cmd: &mut Command) {
-    if !try_run_suppressed(cmd) {
+fn process_status<F: FnOnce()>(
+    cmd: &Command,
+    success: bool,
+    expect: BuildExpectation,
+    f: F,
+) -> bool {
+    use BuildExpectation::*;
+    match (expect, success) {
+        (None, false) => { f(); false },
+        // Non-tool build succeeds, everything is good
+        (None, true) => true,
+        // Tool expected to work and is working
+        (Succeeding, true) => true,
+        // Tool expected to fail and is failing
+        (Failing, false) => {
+            println!("This failure is expected (see `src/tools/toolstate.toml`)");
+            true
+        },
+        // Tool expected to work, but is failing
+        (Succeeding, false) => {
+            f();
+            println!("You can disable the tool in `src/tools/toolstate.toml`");
+            false
+        },
+        // Tool expected to fail, but is working
+        (Failing, true) => {
+            println!("Expected `{:?}` to fail, but it succeeded.\n\
+                     Please adjust `src/tools/toolstate.toml` accordingly", cmd);
+            false
+        }
+    }
+}
+
+pub fn run_suppressed(cmd: &mut Command, expect: BuildExpectation) {
+    if !try_run_suppressed(cmd, expect) {
         std::process::exit(1);
     }
 }
 
-pub fn try_run_suppressed(cmd: &mut Command) -> bool {
+pub fn try_run_suppressed(cmd: &mut Command, expect: BuildExpectation) -> bool {
     let output = match cmd.output() {
         Ok(status) => status,
         Err(e) => fail(&format!("failed to execute command: {:?}\nerror: {}",
                                 cmd, e)),
     };
-    if !output.status.success() {
-        println!("\n\ncommand did not execute successfully: {:?}\n\
+    process_status(
+        cmd,
+        output.status.success(),
+        expect,
+        || println!("\n\ncommand did not execute successfully: {:?}\n\
                   expected success, got: {}\n\n\
                   stdout ----\n{}\n\
                   stderr ----\n{}\n\n",
                  cmd,
                  output.status,
                  String::from_utf8_lossy(&output.stdout),
-                 String::from_utf8_lossy(&output.stderr));
-    }
-    output.status.success()
+                 String::from_utf8_lossy(&output.stderr)))
 }
 
 pub fn gnu_target(target: &str) -> String {
@@ -94,27 +135,6 @@ pub fn gnu_target(target: &str) -> String {
         "i686-pc-windows-gnu" => "i686-w64-mingw32".to_string(),
         "x86_64-pc-windows-gnu" => "x86_64-w64-mingw32".to_string(),
         s => s.to_string(),
-    }
-}
-
-pub fn cc2ar(cc: &Path, target: &str) -> Option<PathBuf> {
-    if target.contains("msvc") {
-        None
-    } else if target.contains("musl") {
-        Some(PathBuf::from("ar"))
-    } else if target.contains("openbsd") {
-        Some(PathBuf::from("ar"))
-    } else {
-        let parent = cc.parent().unwrap();
-        let file = cc.file_name().unwrap().to_str().unwrap();
-        for suffix in &["gcc", "cc", "clang"] {
-            if let Some(idx) = file.rfind(suffix) {
-                let mut file = file[..idx].to_owned();
-                file.push_str("ar");
-                return Some(parent.join(&file));
-            }
-        }
-        Some(parent.join(file))
     }
 }
 
@@ -211,7 +231,7 @@ pub fn native_lib_boilerplate(src_name: &str,
 
     let out_dir = env::var_os("RUSTBUILD_NATIVE_DIR").unwrap_or(env::var_os("OUT_DIR").unwrap());
     let out_dir = PathBuf::from(out_dir).join(out_name);
-    t!(create_dir_racy(&out_dir));
+    t!(fs::create_dir_all(&out_dir));
     if link_name.contains('=') {
         println!("cargo:rustc-link-lib={}", link_name);
     } else {
@@ -259,22 +279,4 @@ fn dir_up_to_date(src: &Path, threshold: &FileTime) -> bool {
 fn fail(s: &str) -> ! {
     println!("\n\n{}\n\n", s);
     std::process::exit(1);
-}
-
-fn create_dir_racy(path: &Path) -> io::Result<()> {
-    match fs::create_dir(path) {
-        Ok(()) => return Ok(()),
-        Err(ref e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
-        Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    match path.parent() {
-        Some(p) => try!(create_dir_racy(p)),
-        None => return Err(io::Error::new(io::ErrorKind::Other, "failed to create whole tree")),
-    }
-    match fs::create_dir(path) {
-        Ok(()) => Ok(()),
-        Err(ref e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(e),
-    }
 }

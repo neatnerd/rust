@@ -45,7 +45,7 @@ impl FromStr for ErrorKind {
 impl fmt::Display for ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            ErrorKind::Help => write!(f, "help"),
+            ErrorKind::Help => write!(f, "help message"),
             ErrorKind::Error => write!(f, "error"),
             ErrorKind::Note => write!(f, "note"),
             ErrorKind::Suggestion => write!(f, "suggestion"),
@@ -175,8 +175,8 @@ fn parse_expected(last_nonfollow_error: Option<usize>,
            msg);
     Some((which,
           Error {
-        line_num: line_num,
-        kind: kind,
-        msg: msg,
+        line_num,
+        kind,
+        msg,
     }))
 }

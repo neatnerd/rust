@@ -86,7 +86,6 @@ use fs;
 use hash::{Hash, Hasher};
 use io;
 use iter::{self, FusedIterator};
-use mem;
 use ops::{self, Deref};
 
 use ffi::{OsStr, OsString};
@@ -317,10 +316,15 @@ fn iter_after<A, I, J>(mut iter: I, mut prefix: J) -> Option<I>
 
 // See note at the top of this module to understand why these are used:
 fn os_str_as_u8_slice(s: &OsStr) -> &[u8] {
-    unsafe { mem::transmute(s) }
+    unsafe { &*(s as *const OsStr as *const [u8]) }
 }
 unsafe fn u8_slice_as_os_str(s: &[u8]) -> &OsStr {
-    mem::transmute(s)
+    &*(s as *const [u8] as *const OsStr)
+}
+
+// Detect scheme on Redox
+fn has_redox_scheme(s: &[u8]) -> bool {
+    cfg!(target_os = "redox") && s.split(|b| *b == b'/').next().unwrap_or(b"").contains(&b':')
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1329,7 +1333,8 @@ impl PathBuf {
     /// [`Path`]: struct.Path.html
     #[stable(feature = "into_boxed_path", since = "1.20.0")]
     pub fn into_boxed_path(self) -> Box<Path> {
-        unsafe { mem::transmute(self.inner.into_boxed_os_str()) }
+        let rw = Box::into_raw(self.inner.into_boxed_os_str()) as *mut Path;
+        unsafe { Box::from_raw(rw) }
     }
 }
 
@@ -1337,7 +1342,8 @@ impl PathBuf {
 impl<'a> From<&'a Path> for Box<Path> {
     fn from(path: &'a Path) -> Box<Path> {
         let boxed: Box<OsStr> = path.inner.into();
-        unsafe { mem::transmute(boxed) }
+        let rw = Box::into_raw(boxed) as *mut Path;
+        unsafe { Box::from_raw(rw) }
     }
 }
 
@@ -1584,7 +1590,7 @@ impl Path {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn new<S: AsRef<OsStr> + ?Sized>(s: &S) -> &Path {
-        unsafe { mem::transmute(s.as_ref()) }
+        unsafe { &*(s.as_ref() as *const OsStr as *const Path) }
     }
 
     /// Yields the underlying [`OsStr`] slice.
@@ -1685,8 +1691,12 @@ impl Path {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[allow(deprecated)]
     pub fn is_absolute(&self) -> bool {
-        // FIXME: Remove target_os = "redox" and allow Redox prefixes
-        self.has_root() && (cfg!(unix) || cfg!(target_os = "redox") || self.prefix().is_some())
+        if !cfg!(target_os = "redox") {
+            self.has_root() && (cfg!(unix) || self.prefix().is_some())
+        } else {
+            // FIXME: Allow Redox prefixes
+            has_redox_scheme(self.as_u8_slice())
+        }
     }
 
     /// Returns `true` if the `Path` is relative, i.e. not absolute.
@@ -2049,8 +2059,9 @@ impl Path {
         let prefix = parse_prefix(self.as_os_str());
         Components {
             path: self.as_u8_slice(),
-            prefix: prefix,
-            has_physical_root: has_physical_root(self.as_u8_slice(), prefix),
+            prefix,
+            has_physical_root: has_physical_root(self.as_u8_slice(), prefix) ||
+                               has_redox_scheme(self.as_u8_slice()),
             front: State::Prefix,
             back: State::Body,
         }
@@ -2302,7 +2313,8 @@ impl Path {
     /// [`PathBuf`]: struct.PathBuf.html
     #[stable(feature = "into_boxed_path", since = "1.20.0")]
     pub fn into_path_buf(self: Box<Path>) -> PathBuf {
-        let inner: Box<OsStr> = unsafe { mem::transmute(self) };
+        let rw = Box::into_raw(self) as *mut OsStr;
+        let inner = unsafe { Box::from_raw(rw) };
         PathBuf { inner: OsString::from(inner) }
     }
 }
@@ -3952,5 +3964,11 @@ mod tests {
         path.clone_into(&mut path_buf);
         assert_eq!(path, path_buf);
         assert!(path_buf.into_os_string().capacity() >= 15);
+    }
+
+    #[test]
+    fn display_format_flags() {
+        assert_eq!(format!("a{:#<5}b", Path::new("").display()), "a#####b");
+        assert_eq!(format!("a{:#<5}b", Path::new("a").display()), "aa####b");
     }
 }

@@ -12,19 +12,18 @@
 
 use hir::def_id::DefId;
 
+use middle::const_val::ConstVal;
 use middle::region;
 use ty::subst::{Substs, Subst};
 use ty::{self, AdtDef, TypeFlags, Ty, TyCtxt, TypeFoldable};
 use ty::{Slice, TyS};
 use ty::subst::Kind;
 
-use std::fmt;
 use std::iter;
 use std::cmp::Ordering;
 use syntax::abi;
 use syntax::ast::{self, Name};
 use syntax::symbol::keywords;
-use util::nodemap::FxHashMap;
 
 use serialize;
 
@@ -109,7 +108,7 @@ pub enum TypeVariants<'tcx> {
     TyStr,
 
     /// An array with the given length. Written as `[T; n]`.
-    TyArray(Ty<'tcx>, usize),
+    TyArray(Ty<'tcx>, &'tcx ty::Const<'tcx>),
 
     /// The pointee of an array slice.  Written as `[T]`.
     TySlice(Ty<'tcx>),
@@ -134,6 +133,10 @@ pub enum TypeVariants<'tcx> {
     /// The anonymous type of a closure. Used to represent the type of
     /// `|a| a`.
     TyClosure(DefId, ClosureSubsts<'tcx>),
+
+    /// The anonymous type of a generator. Used to represent the type of
+    /// `|a| yield a`.
+    TyGenerator(DefId, ClosureSubsts<'tcx>, GeneratorInterior<'tcx>),
 
     /// The never type `!`
     TyNever,
@@ -209,8 +212,8 @@ pub enum TypeVariants<'tcx> {
 /// as extra type parameters? The reason for this design is that the
 /// upvar types can reference lifetimes that are internal to the
 /// creating function. In my example above, for example, the lifetime
-/// `'b` represents the extent of the closure itself; this is some
-/// subset of `foo`, probably just the extent of the call to the to
+/// `'b` represents the scope of the closure itself; this is some
+/// subset of `foo`, probably just the scope of the call to the to
 /// `do()`. If we just had the lifetime/type parameters from the
 /// enclosing function, we couldn't name this lifetime `'b`. Note that
 /// there can also be lifetimes in the types of the upvars themselves,
@@ -258,6 +261,51 @@ impl<'a, 'gcx, 'acx, 'tcx> ClosureSubsts<'tcx> {
         let generics = tcx.generics_of(def_id);
         self.substs[self.substs.len()-generics.own_count()..].iter().map(
             |t| t.as_type().expect("unexpected region in upvars"))
+    }
+}
+
+impl<'a, 'gcx, 'tcx> ClosureSubsts<'tcx> {
+    /// This returns the types of the MIR locals which had to be stored across suspension points.
+    /// It is calculated in rustc_mir::transform::generator::StateTransform.
+    /// All the types here must be in the tuple in GeneratorInterior.
+    pub fn state_tys(self, def_id: DefId, tcx: TyCtxt<'a, 'gcx, 'tcx>) ->
+        impl Iterator<Item=Ty<'tcx>> + 'a
+    {
+        let state = tcx.generator_layout(def_id).fields.iter();
+        state.map(move |d| d.ty.subst(tcx, self.substs))
+    }
+
+    /// This is the types of all the fields stored in a generator.
+    /// It includes the upvars, state types and the state discriminant which is u32.
+    pub fn field_tys(self, def_id: DefId, tcx: TyCtxt<'a, 'gcx, 'tcx>) ->
+        impl Iterator<Item=Ty<'tcx>> + 'a
+    {
+        let upvars = self.upvar_tys(def_id, tcx);
+        let state = self.state_tys(def_id, tcx);
+        upvars.chain(iter::once(tcx.types.u32)).chain(state)
+    }
+}
+
+/// This describes the types that can be contained in a generator.
+/// It will be a type variable initially and unified in the last stages of typeck of a body.
+/// It contains a tuple of all the types that could end up on a generator frame.
+/// The state transformation MIR pass may only produce layouts which mention types in this tuple.
+/// Upvars are not counted here.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, RustcEncodable, RustcDecodable)]
+pub struct GeneratorInterior<'tcx> {
+    pub witness: Ty<'tcx>,
+}
+
+impl<'tcx> GeneratorInterior<'tcx> {
+    pub fn new(witness: Ty<'tcx>) -> GeneratorInterior<'tcx> {
+        GeneratorInterior { witness }
+    }
+
+    pub fn as_slice(&self) -> &'tcx Slice<Ty<'tcx>> {
+        match self.witness.sty {
+            ty::TyTuple(s, _) => s,
+            _ => bug!(),
+        }
     }
 }
 
@@ -527,12 +575,6 @@ impl<T> Binder<T> {
     }
 }
 
-impl fmt::Debug for TypeFlags {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{:x}", self.bits)
-    }
-}
-
 /// Represents the projection of an associated type. In explicit UFCS
 /// form this would be written `<T as Trait<..>>::N`.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, RustcEncodable, RustcDecodable)]
@@ -553,9 +595,10 @@ impl<'a, 'tcx> ProjectionTy<'tcx> {
     pub fn from_ref_and_name(
         tcx: TyCtxt, trait_ref: ty::TraitRef<'tcx>, item_name: Name
     ) -> ProjectionTy<'tcx> {
-        let item_def_id = tcx.associated_items(trait_ref.def_id).find(
-            |item| item.name == item_name && item.kind == ty::AssociatedKind::Type
-        ).unwrap().def_id;
+        let item_def_id = tcx.associated_items(trait_ref.def_id).find(|item| {
+            item.kind == ty::AssociatedKind::Type &&
+            tcx.hygienic_eq(item_name, item.name, trait_ref.def_id)
+        }).unwrap().def_id;
 
         ProjectionTy {
             substs: trait_ref.substs,
@@ -569,7 +612,7 @@ impl<'a, 'tcx> ProjectionTy<'tcx> {
     pub fn trait_ref(&self, tcx: TyCtxt) -> ty::TraitRef<'tcx> {
         let def_id = tcx.associated_item(self.item_def_id).container.id();
         ty::TraitRef {
-            def_id: def_id,
+            def_id,
             substs: self.substs,
         }
     }
@@ -579,6 +622,22 @@ impl<'a, 'tcx> ProjectionTy<'tcx> {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, RustcEncodable, RustcDecodable)]
+pub struct GenSig<'tcx> {
+    pub yield_ty: Ty<'tcx>,
+    pub return_ty: Ty<'tcx>,
+}
+
+pub type PolyGenSig<'tcx> = Binder<GenSig<'tcx>>;
+
+impl<'tcx> PolyGenSig<'tcx> {
+    pub fn yield_ty(&self) -> ty::Binder<Ty<'tcx>> {
+        self.map_bound_ref(|sig| sig.yield_ty)
+    }
+    pub fn return_ty(&self) -> ty::Binder<Ty<'tcx>> {
+        self.map_bound_ref(|sig| sig.return_ty)
+    }
+}
 
 /// Signature of a function type, which I have arbitrarily
 /// decided to use to refer to the input/output types.
@@ -739,7 +798,7 @@ pub type Region<'tcx> = &'tcx RegionKind;
 ///
 /// The process of doing that is called "skolemization". The bound regions
 /// are replaced by skolemized markers, which don't satisfy any relation
-/// not explicity provided.
+/// not explicitly provided.
 ///
 /// There are 2 kinds of skolemized regions in rustc: `ReFree` and
 /// `ReSkolemized`. When checking an item's body, `ReFree` is supposed
@@ -780,10 +839,10 @@ pub enum RegionKind {
     /// region parameters.
     ReFree(FreeRegion),
 
-    /// A concrete region naming some statically determined extent
+    /// A concrete region naming some statically determined scope
     /// (e.g. an expression or sequence of statements) within the
     /// current function.
-    ReScope(region::CodeExtent),
+    ReScope(region::Scope),
 
     /// Static data that has an "infinite" lifetime. Top in the region lattice.
     ReStatic,
@@ -874,7 +933,7 @@ impl<'a, 'tcx, 'gcx> ExistentialProjection<'tcx> {
     pub fn trait_ref(&self, tcx: TyCtxt) -> ty::ExistentialTraitRef<'tcx> {
         let def_id = tcx.associated_item(self.item_def_id).container.id();
         ty::ExistentialTraitRef{
-            def_id: def_id,
+            def_id,
             substs: self.substs,
         }
     }
@@ -976,19 +1035,6 @@ impl RegionKind {
 
         flags
     }
-
-    // This method returns whether the given Region is Named
-    pub fn is_named_region(&self) -> bool {
-        match *self {
-            ty::ReFree(ref free_region) => {
-                match free_region.bound_region {
-                    ty::BrNamed(..) => true,
-                    _ => false,
-                }
-            }
-            _ => false,
-        }
-    }
 }
 
 /// Type utilities
@@ -1021,54 +1067,6 @@ impl<'a, 'gcx, 'tcx> TyS<'tcx> {
             TyTuple(_, true) => true,
             _ => false,
         }
-    }
-
-    /// Checks whether a type is visibly uninhabited from a particular module.
-    /// # Example
-    /// ```rust
-    /// enum Void {}
-    /// mod a {
-    ///     pub mod b {
-    ///         pub struct SecretlyUninhabited {
-    ///             _priv: !,
-    ///         }
-    ///     }
-    /// }
-    ///
-    /// mod c {
-    ///     pub struct AlsoSecretlyUninhabited {
-    ///         _priv: Void,
-    ///     }
-    ///     mod d {
-    ///     }
-    /// }
-    ///
-    /// struct Foo {
-    ///     x: a::b::SecretlyUninhabited,
-    ///     y: c::AlsoSecretlyUninhabited,
-    /// }
-    /// ```
-    /// In this code, the type `Foo` will only be visibly uninhabited inside the
-    /// modules b, c and d. This effects pattern-matching on `Foo` or types that
-    /// contain `Foo`.
-    ///
-    /// # Example
-    /// ```rust
-    /// let foo_result: Result<T, Foo> = ... ;
-    /// let Ok(t) = foo_result;
-    /// ```
-    /// This code should only compile in modules where the uninhabitedness of Foo is
-    /// visible.
-    pub fn is_uninhabited_from(&self, module: DefId, tcx: TyCtxt<'a, 'gcx, 'tcx>) -> bool {
-        let mut visited = FxHashMap::default();
-        let forest = self.uninhabited_from(&mut visited, tcx);
-
-        // To check whether this type is uninhabited at all (not just from the
-        // given node) you could check whether the forest is empty.
-        // ```
-        // forest.is_empty()
-        // ```
-        forest.contains(tcx, module)
     }
 
     pub fn is_primitive(&self) -> bool {
@@ -1379,7 +1377,7 @@ impl<'a, 'gcx, 'tcx> TyS<'tcx> {
             TyAdt(_, substs) | TyAnon(_, substs) => {
                 substs.regions().collect()
             }
-            TyClosure(_, ref substs) => {
+            TyClosure(_, ref substs) | TyGenerator(_, ref substs, _) => {
                 substs.substs.regions().collect()
             }
             TyProjection(ref data) => {
@@ -1406,3 +1404,14 @@ impl<'a, 'gcx, 'tcx> TyS<'tcx> {
         }
     }
 }
+
+/// Typed constant value.
+#[derive(Copy, Clone, Debug, Hash, RustcEncodable, RustcDecodable, Eq, PartialEq)]
+pub struct Const<'tcx> {
+    pub ty: Ty<'tcx>,
+
+    // FIXME(eddyb) Replace this with a miri value.
+    pub val: ConstVal<'tcx>,
+}
+
+impl<'tcx> serialize::UseSpecializedDecodable for &'tcx Const<'tcx> {}

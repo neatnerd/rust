@@ -11,11 +11,9 @@
 pub use self::code_stats::{CodeStats, DataTypeKind, FieldInfo};
 pub use self::code_stats::{SizeKind, TypeSizeInfo, VariantInfo};
 
-use dep_graph::DepGraph;
 use hir::def_id::{CrateNum, DefIndex};
 
 use lint;
-use middle::cstore::CrateStore;
 use middle::allocator::AllocatorKind;
 use middle::dependency_format;
 use session::search_paths::PathKind;
@@ -56,30 +54,27 @@ pub mod config;
 pub mod filesearch;
 pub mod search_paths;
 
-// Represents the data associated with a compilation
-// session for a single crate.
+/// Represents the data associated with a compilation
+/// session for a single crate.
 pub struct Session {
-    pub dep_graph: DepGraph,
     pub target: config::Config,
     pub host: Target,
     pub opts: config::Options,
-    pub cstore: Rc<CrateStore>,
     pub parse_sess: ParseSess,
-    // For a library crate, this is always none
+    /// For a library crate, this is always none
     pub entry_fn: RefCell<Option<(NodeId, Span)>>,
     pub entry_type: Cell<Option<config::EntryFnType>>,
     pub plugin_registrar_fn: Cell<Option<ast::NodeId>>,
     pub derive_registrar_fn: Cell<Option<ast::NodeId>>,
     pub default_sysroot: Option<PathBuf>,
-    // The name of the root source file of the crate, in the local file system.
-    // The path is always expected to be absolute. `None` means that there is no
-    // source file.
+    /// The name of the root source file of the crate, in the local file system.
+    /// `None` means that there is no source file.
     pub local_crate_source_file: Option<String>,
-    // The directory the compiler has been executed in plus a flag indicating
-    // if the value stored here has been affected by path remapping.
+    /// The directory the compiler has been executed in plus a flag indicating
+    /// if the value stored here has been affected by path remapping.
     pub working_dir: (String, bool),
     pub lint_store: RefCell<lint::LintStore>,
-    pub lints: RefCell<lint::LintTable>,
+    pub buffered_lints: RefCell<Option<lint::LintBuffer>>,
     /// Set of (LintId, Option<Span>, message) tuples tracking lint
     /// (sub)diagnostics that have been set once, but should not be set again,
     /// in order to avoid redundantly verbose output (Issue #24690).
@@ -88,12 +83,12 @@ pub struct Session {
     pub plugin_attributes: RefCell<Vec<(String, AttributeType)>>,
     pub crate_types: RefCell<Vec<config::CrateType>>,
     pub dependency_formats: RefCell<dependency_format::Dependencies>,
-    // The crate_disambiguator is constructed out of all the `-C metadata`
-    // arguments passed to the compiler. Its value together with the crate-name
-    // forms a unique global identifier for the crate. It is used to allow
-    // multiple crates with the same name to coexist. See the
-    // trans::back::symbol_names module for more information.
-    pub crate_disambiguator: RefCell<Symbol>,
+    /// The crate_disambiguator is constructed out of all the `-C metadata`
+    /// arguments passed to the compiler. Its value together with the crate-name
+    /// forms a unique global identifier for the crate. It is used to allow
+    /// multiple crates with the same name to coexist. See the
+    /// trans::back::symbol_names module for more information.
+    pub crate_disambiguator: RefCell<Option<Symbol>>,
     pub features: RefCell<feature_gate::Features>,
 
     /// The maximum recursion limit for potentially infinitely recursive
@@ -112,7 +107,7 @@ pub struct Session {
 
     /// Map from imported macro spans (which consist of
     /// the localized span for the macro body) to the
-    /// macro name and defintion span in the source crate.
+    /// macro name and definition span in the source crate.
     pub imported_macro_spans: RefCell<HashMap<Span, (String, Span)>>,
 
     incr_comp_session: RefCell<IncrCompSession>,
@@ -148,17 +143,17 @@ pub struct Session {
 }
 
 pub struct PerfStats {
-    // The accumulated time needed for computing the SVH of the crate
+    /// The accumulated time needed for computing the SVH of the crate
     pub svh_time: Cell<Duration>,
-    // The accumulated time spent on computing incr. comp. hashes
+    /// The accumulated time spent on computing incr. comp. hashes
     pub incr_comp_hashes_time: Cell<Duration>,
-    // The number of incr. comp. hash computations performed
+    /// The number of incr. comp. hash computations performed
     pub incr_comp_hashes_count: Cell<u64>,
-    // The number of bytes hashed when computing ICH values
+    /// The number of bytes hashed when computing ICH values
     pub incr_comp_bytes_hashed: Cell<u64>,
-    // The accumulated time spent on computing symbol hashes
+    /// The accumulated time spent on computing symbol hashes
     pub symbol_hash_time: Cell<Duration>,
-    // The accumulated time spent decoding def path tables from metadata
+    /// The accumulated time spent decoding def path tables from metadata
     pub decode_def_path_tables_time: Cell<Duration>,
 }
 
@@ -171,7 +166,10 @@ enum DiagnosticBuilderMethod {
 
 impl Session {
     pub fn local_crate_disambiguator(&self) -> Symbol {
-        *self.crate_disambiguator.borrow()
+        match *self.crate_disambiguator.borrow() {
+            Some(sym) => sym,
+            None => bug!("accessing disambiguator before initialization"),
+        }
     }
     pub fn struct_span_warn<'a, S: Into<MultiSpan>>(&'a self,
                                                     sp: S,
@@ -307,22 +305,15 @@ impl Session {
         self.diagnostic().unimpl(msg)
     }
 
-    pub fn add_lint<S: Into<MultiSpan>>(&self,
-                                        lint: &'static lint::Lint,
-                                        id: ast::NodeId,
-                                        sp: S,
-                                        msg: String)
-    {
-        self.lints.borrow_mut().add_lint(lint, id, sp, msg);
-    }
-
-    pub fn add_lint_diagnostic<M>(&self,
-                                  lint: &'static lint::Lint,
-                                  id: ast::NodeId,
-                                  msg: M)
-        where M: lint::IntoEarlyLint,
-    {
-        self.lints.borrow_mut().add_lint_diagnostic(lint, id, msg);
+    pub fn buffer_lint<S: Into<MultiSpan>>(&self,
+                                           lint: &'static lint::Lint,
+                                           id: ast::NodeId,
+                                           sp: S,
+                                           msg: &str) {
+        match *self.buffered_lints.borrow_mut() {
+            Some(ref mut buffer) => buffer.add_lint(lint, id, sp.into(), msg),
+            None => bug!("can't buffer lints after HIR lowering"),
+        }
     }
 
     pub fn reserve_node_ids(&self, count: usize) -> ast::NodeId {
@@ -396,6 +387,13 @@ impl Session {
     }
     pub fn verbose(&self) -> bool { self.opts.debugging_opts.verbose }
     pub fn time_passes(&self) -> bool { self.opts.debugging_opts.time_passes }
+    pub fn profile_queries(&self) -> bool {
+        self.opts.debugging_opts.profile_queries ||
+            self.opts.debugging_opts.profile_queries_and_keys
+    }
+    pub fn profile_queries_and_keys(&self) -> bool {
+        self.opts.debugging_opts.profile_queries_and_keys
+    }
     pub fn count_llvm_insns(&self) -> bool {
         self.opts.debugging_opts.count_llvm_insns
     }
@@ -409,6 +407,11 @@ impl Session {
     pub fn borrowck_stats(&self) -> bool { self.opts.debugging_opts.borrowck_stats }
     pub fn print_llvm_passes(&self) -> bool {
         self.opts.debugging_opts.print_llvm_passes
+    }
+    pub fn emit_end_regions(&self) -> bool {
+        self.opts.debugging_opts.emit_end_regions ||
+            (self.opts.debugging_opts.mir_emit_validate > 0) ||
+            self.opts.debugging_opts.borrowck_mir
     }
     pub fn lto(&self) -> bool {
         self.opts.cg.lto
@@ -434,6 +437,31 @@ impl Session {
         self.opts.cg.overflow_checks
             .or(self.opts.debugging_opts.force_overflow_checks)
             .unwrap_or(self.opts.debug_assertions)
+    }
+
+    pub fn crt_static(&self) -> bool {
+        // If the target does not opt in to crt-static support, use its default.
+        if self.target.target.options.crt_static_respected {
+            self.crt_static_feature()
+        } else {
+            self.target.target.options.crt_static_default
+        }
+    }
+
+    pub fn crt_static_feature(&self) -> bool {
+        let requested_features = self.opts.cg.target_feature.split(',');
+        let found_negative = requested_features.clone().any(|r| r == "-crt-static");
+        let found_positive = requested_features.clone().any(|r| r == "+crt-static");
+
+        // If the target we're compiling for requests a static crt by default,
+        // then see if the `-crt-static` feature was passed to disable that.
+        // Otherwise if we don't have a static crt by default then see if the
+        // `+crt-static` feature was passed.
+        if self.target.target.options.crt_static_default {
+            !found_negative
+        } else {
+            found_positive
+        }
     }
 
     pub fn must_not_eliminate_frame_pointers(&self) -> bool {
@@ -474,9 +502,29 @@ impl Session {
             kind)
     }
 
+    pub fn set_incr_session_load_dep_graph(&self, load: bool) {
+        let mut incr_comp_session = self.incr_comp_session.borrow_mut();
+
+        match *incr_comp_session {
+            IncrCompSession::Active { ref mut load_dep_graph, .. } => {
+                *load_dep_graph = load;
+            }
+            _ => {}
+        }
+    }
+
+    pub fn incr_session_load_dep_graph(&self) -> bool {
+        let incr_comp_session = self.incr_comp_session.borrow();
+        match *incr_comp_session {
+            IncrCompSession::Active { load_dep_graph, .. } => load_dep_graph,
+            _ => false,
+        }
+    }
+
     pub fn init_incr_comp_session(&self,
                                   session_dir: PathBuf,
-                                  lock_file: flock::Lock) {
+                                  lock_file: flock::Lock,
+                                  load_dep_graph: bool) {
         let mut incr_comp_session = self.incr_comp_session.borrow_mut();
 
         if let IncrCompSession::NotInitialized = *incr_comp_session { } else {
@@ -486,6 +534,7 @@ impl Session {
         *incr_comp_session = IncrCompSession::Active {
             session_directory: session_dir,
             lock_file,
+            load_dep_graph,
         };
     }
 
@@ -587,42 +636,77 @@ impl Session {
         }
         ret
     }
+
+    /// Returns the number of codegen units that should be used for this
+    /// compilation
+    pub fn codegen_units(&self) -> usize {
+        if let Some(n) = self.opts.cli_forced_codegen_units {
+            return n
+        }
+        if let Some(n) = self.target.target.options.default_codegen_units {
+            return n as usize
+        }
+
+        match self.opts.optimize {
+            // If we're compiling at `-O0` then default to 16 codegen units.
+            // The number here shouldn't matter too too much as debug mode
+            // builds don't rely on performance at all, meaning that lost
+            // opportunities for inlining through multiple codegen units is
+            // a non-issue.
+            //
+            // Note that the high number here doesn't mean that we'll be
+            // spawning a large number of threads in parallel. The backend
+            // of rustc contains global rate limiting through the
+            // `jobserver` crate so we'll never overload the system with too
+            // much work, but rather we'll only be optimizing when we're
+            // otherwise cooperating with other instances of rustc.
+            //
+            // Rather the high number here means that we should be able to
+            // keep a lot of idle cpus busy. By ensuring that no codegen
+            // unit takes *too* long to build we'll be guaranteed that all
+            // cpus will finish pretty closely to one another and we should
+            // make relatively optimal use of system resources
+            config::OptLevel::No => 16,
+
+            // All other optimization levels default use one codegen unit,
+            // the historical default in Rust for a Long Time.
+            _ => 1,
+        }
+    }
 }
 
 pub fn build_session(sopts: config::Options,
-                     dep_graph: &DepGraph,
                      local_crate_source_file: Option<PathBuf>,
-                     registry: errors::registry::Registry,
-                     cstore: Rc<CrateStore>)
+                     registry: errors::registry::Registry)
                      -> Session {
     let file_path_mapping = sopts.file_path_mapping();
 
     build_session_with_codemap(sopts,
-                               dep_graph,
                                local_crate_source_file,
                                registry,
-                               cstore,
                                Rc::new(codemap::CodeMap::new(file_path_mapping)),
                                None)
 }
 
 pub fn build_session_with_codemap(sopts: config::Options,
-                                  dep_graph: &DepGraph,
                                   local_crate_source_file: Option<PathBuf>,
                                   registry: errors::registry::Registry,
-                                  cstore: Rc<CrateStore>,
                                   codemap: Rc<codemap::CodeMap>,
                                   emitter_dest: Option<Box<Write + Send>>)
                                   -> Session {
     // FIXME: This is not general enough to make the warning lint completely override
     // normal diagnostic warnings, since the warning lint can also be denied and changed
     // later via the source code.
-    let can_print_warnings = sopts.lint_opts
+    let warnings_allow = sopts.lint_opts
         .iter()
         .filter(|&&(ref key, _)| *key == "warnings")
-        .map(|&(_, ref level)| *level != lint::Allow)
+        .map(|&(_, ref level)| *level == lint::Allow)
         .last()
-        .unwrap_or(true);
+        .unwrap_or(false);
+    let cap_lints_allow = sopts.lint_cap.map_or(false, |cap| cap == lint::Allow);
+
+    let can_print_warnings = !(warnings_allow || cap_lints_allow);
+
     let treat_err_as_bug = sopts.debugging_opts.treat_err_as_bug;
 
     let emitter: Box<Emitter> = match (sopts.error_format, emitter_dest) {
@@ -648,19 +732,15 @@ pub fn build_session_with_codemap(sopts: config::Options,
                                       emitter);
 
     build_session_(sopts,
-                   dep_graph,
                    local_crate_source_file,
                    diagnostic_handler,
-                   codemap,
-                   cstore)
+                   codemap)
 }
 
 pub fn build_session_(sopts: config::Options,
-                      dep_graph: &DepGraph,
                       local_crate_source_file: Option<PathBuf>,
                       span_diagnostic: errors::Handler,
-                      codemap: Rc<codemap::CodeMap>,
-                      cstore: Rc<CrateStore>)
+                      codemap: Rc<codemap::CodeMap>)
                       -> Session {
     let host = match Target::search(config::host_triple()) {
         Ok(t) => t,
@@ -678,7 +758,6 @@ pub fn build_session_(sopts: config::Options,
 
     let file_path_mapping = sopts.file_path_mapping();
 
-    // Make the path absolute, if necessary
     let local_crate_source_file = local_crate_source_file.map(|path| {
         file_path_mapping.map_prefix(path.to_string_lossy().into_owned()).0
     });
@@ -693,11 +772,9 @@ pub fn build_session_(sopts: config::Options,
     let working_dir = file_path_mapping.map_prefix(working_dir);
 
     let sess = Session {
-        dep_graph: dep_graph.clone(),
         target: target_cfg,
         host,
         opts: sopts,
-        cstore,
         parse_sess: p_s,
         // For a library crate, this is always none
         entry_fn: RefCell::new(None),
@@ -708,13 +785,13 @@ pub fn build_session_(sopts: config::Options,
         local_crate_source_file,
         working_dir,
         lint_store: RefCell::new(lint::LintStore::new()),
-        lints: RefCell::new(lint::LintTable::new()),
+        buffered_lints: RefCell::new(Some(lint::LintBuffer::new())),
         one_time_diagnostics: RefCell::new(FxHashSet()),
         plugin_llvm_passes: RefCell::new(Vec::new()),
         plugin_attributes: RefCell::new(Vec::new()),
         crate_types: RefCell::new(Vec::new()),
         dependency_formats: RefCell::new(FxHashMap()),
-        crate_disambiguator: RefCell::new(Symbol::intern("")),
+        crate_disambiguator: RefCell::new(None),
         features: RefCell::new(feature_gate::Features::new()),
         recursion_limit: Cell::new(64),
         type_length_limit: Cell::new(1048576),
@@ -764,23 +841,24 @@ pub fn build_session_(sopts: config::Options,
 /// Holds data on the current incremental compilation session, if there is one.
 #[derive(Debug)]
 pub enum IncrCompSession {
-    // This is the state the session will be in until the incr. comp. dir is
-    // needed.
+    /// This is the state the session will be in until the incr. comp. dir is
+    /// needed.
     NotInitialized,
-    // This is the state during which the session directory is private and can
-    // be modified.
+    /// This is the state during which the session directory is private and can
+    /// be modified.
     Active {
         session_directory: PathBuf,
         lock_file: flock::Lock,
+        load_dep_graph: bool,
     },
-    // This is the state after the session directory has been finalized. In this
-    // state, the contents of the directory must not be modified any more.
+    /// This is the state after the session directory has been finalized. In this
+    /// state, the contents of the directory must not be modified any more.
     Finalized {
         session_directory: PathBuf,
     },
-    // This is an error state that is reached when some compilation error has
-    // occurred. It indicates that the contents of the session directory must
-    // not be used, since they might be invalid.
+    /// This is an error state that is reached when some compilation error has
+    /// occurred. It indicates that the contents of the session directory must
+    /// not be used, since they might be invalid.
     InvalidBecauseOfErrors {
         session_directory: PathBuf,
     }
@@ -835,7 +913,7 @@ pub fn compile_result_from_err_count(err_count: usize) -> CompileResult {
 #[inline(never)]
 pub fn bug_fmt(file: &'static str, line: u32, args: fmt::Arguments) -> ! {
     // this wrapper mostly exists so I don't have to write a fully
-    // qualified path of None::<Span> inside the bug!() macro defintion
+    // qualified path of None::<Span> inside the bug!() macro definition
     opt_span_bug_fmt(file, line, None::<Span>, args);
 }
 

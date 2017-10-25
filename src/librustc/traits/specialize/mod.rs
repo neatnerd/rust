@@ -20,11 +20,12 @@
 use super::{SelectionContext, FulfillmentContext};
 use super::util::impl_trait_ref_and_oblig;
 
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use hir::def_id::DefId;
 use infer::{InferCtxt, InferOk};
 use ty::subst::{Subst, Substs};
 use traits::{self, Reveal, ObligationCause};
+use traits::select::IntercrateAmbiguityCause;
 use ty::{self, TyCtxt, TypeFoldable};
 use syntax_pos::DUMMY_SP;
 use std::rc::Rc;
@@ -36,6 +37,7 @@ pub struct OverlapError {
     pub with_impl: DefId,
     pub trait_desc: String,
     pub self_desc: Option<String>,
+    pub intercrate_ambiguity_causes: Vec<IntercrateAmbiguityCause>,
 }
 
 /// Given a subst for the requested impl, translate it to a subst
@@ -123,7 +125,7 @@ pub fn find_associated_item<'a, 'tcx>(
     let trait_def = tcx.trait_def(trait_def_id);
 
     let ancestors = trait_def.ancestors(tcx, impl_data.impl_def_id);
-    match ancestors.defs(tcx, item.name, item.kind).next() {
+    match ancestors.defs(tcx, item.name, item.kind, trait_def_id).next() {
         Some(node_item) => {
             let substs = tcx.infer_ctxt().enter(|infcx| {
                 let param_env = ty::ParamEnv::empty(Reveal::All);
@@ -150,14 +152,11 @@ pub fn find_associated_item<'a, 'tcx>(
 /// Specialization is determined by the sets of types to which the impls apply;
 /// impl1 specializes impl2 if it applies to a subset of the types impl2 applies
 /// to.
-pub fn specializes<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
-                             impl1_def_id: DefId,
-                             impl2_def_id: DefId) -> bool {
+pub(super) fn specializes<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
+                                    (impl1_def_id, impl2_def_id): (DefId, DefId))
+    -> bool
+{
     debug!("specializes({:?}, {:?})", impl1_def_id, impl2_def_id);
-
-    if let Some(r) = tcx.specializes_cache.borrow().check(impl1_def_id, impl2_def_id) {
-        return r;
-    }
 
     // The feature gate should prevent introducing new specializations, but not
     // taking advantage of upstream ones.
@@ -188,7 +187,7 @@ pub fn specializes<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     let impl1_trait_ref = tcx.impl_trait_ref(impl1_def_id).unwrap();
 
     // Create a infcx, taking the predicates of impl1 as assumptions:
-    let result = tcx.infer_ctxt().enter(|infcx| {
+    tcx.infer_ctxt().enter(|infcx| {
         // Normalize the trait reference. The WF rules ought to ensure
         // that this always succeeds.
         let impl1_trait_ref =
@@ -204,10 +203,7 @@ pub fn specializes<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
 
         // Attempt to prove that impl2 applies, given all of the above.
         fulfill_implication(&infcx, penv, impl1_trait_ref, impl2_def_id).is_ok()
-    });
-
-    tcx.specializes_cache.borrow_mut().insert(impl1_def_id, impl2_def_id, result);
-    result
+    })
 }
 
 /// Attempt to fulfill all obligations of `target_impl` after unification with
@@ -300,7 +296,8 @@ pub(super) fn specialization_graph_provider<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx
                                                       -> Rc<specialization_graph::Graph> {
     let mut sg = specialization_graph::Graph::new();
 
-    let mut trait_impls: Vec<DefId> = tcx.trait_impls_of(trait_id).iter().collect();
+    let mut trait_impls = Vec::new();
+    tcx.for_each_impl(trait_id, |impl_did| trait_impls.push(impl_did));
 
     // The coherence checking implementation seems to rely on impls being
     // iterated over (roughly) in definition order, so we are sorting by
@@ -338,8 +335,17 @@ pub(super) fn specialization_graph_provider<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx
                                                             |ty| format!(" for `{}`", ty))));
                     }
                     Err(cname) => {
-                        err.note(&format!("conflicting implementation in crate `{}`", cname));
+                        let msg = match to_pretty_impl_header(tcx, overlap.with_impl) {
+                            Some(s) => format!(
+                                "conflicting implementation in crate `{}`:\n- {}", cname, s),
+                            None => format!("conflicting implementation in crate `{}`", cname),
+                        };
+                        err.note(&msg);
                     }
+                }
+
+                for cause in &overlap.intercrate_ambiguity_causes {
+                    cause.add_intercrate_ambiguity_hint(&mut err);
                 }
 
                 err.emit();
@@ -351,4 +357,57 @@ pub(super) fn specialization_graph_provider<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx
     }
 
     Rc::new(sg)
+}
+
+/// Recovers the "impl X for Y" signature from `impl_def_id` and returns it as a
+/// string.
+fn to_pretty_impl_header(tcx: TyCtxt, impl_def_id: DefId) -> Option<String> {
+    use std::fmt::Write;
+
+    let trait_ref = if let Some(tr) = tcx.impl_trait_ref(impl_def_id) {
+        tr
+    } else {
+        return None;
+    };
+
+    let mut w = "impl".to_owned();
+
+    let substs = Substs::identity_for_item(tcx, impl_def_id);
+
+    // FIXME: Currently only handles ?Sized.
+    //        Needs to support ?Move and ?DynSized when they are implemented.
+    let mut types_without_default_bounds = FxHashSet::default();
+    let sized_trait = tcx.lang_items().sized_trait();
+
+    if !substs.is_noop() {
+        types_without_default_bounds.extend(substs.types());
+        w.push('<');
+        w.push_str(&substs.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(", "));
+        w.push('>');
+    }
+
+    write!(w, " {} for {}", trait_ref, tcx.type_of(impl_def_id)).unwrap();
+
+    // The predicates will contain default bounds like `T: Sized`. We need to
+    // remove these bounds, and add `T: ?Sized` to any untouched type parameters.
+    let predicates = tcx.predicates_of(impl_def_id).predicates;
+    let mut pretty_predicates = Vec::with_capacity(predicates.len());
+    for p in predicates {
+        if let Some(poly_trait_ref) = p.to_opt_poly_trait_ref() {
+            if Some(poly_trait_ref.def_id()) == sized_trait {
+                types_without_default_bounds.remove(poly_trait_ref.self_ty());
+                continue;
+            }
+        }
+        pretty_predicates.push(p.to_string());
+    }
+    for ty in types_without_default_bounds {
+        pretty_predicates.push(format!("{}: ?Sized", ty));
+    }
+    if !pretty_predicates.is_empty() {
+        write!(w, "\n  where {}", pretty_predicates.join(", ")).unwrap();
+    }
+
+    w.push(';');
+    Some(w)
 }

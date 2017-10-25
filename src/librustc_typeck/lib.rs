@@ -50,6 +50,8 @@ independently:
 
 - variance: variance inference
 
+- outlives: outlives inference
+
 - check: walks over function bodies and type checks them, inferring types for
   local variables, type parameters, etc as necessary.
 
@@ -63,9 +65,6 @@ This API is completely unstable and subject to change.
 
 */
 
-#![crate_name = "rustc_typeck"]
-#![crate_type = "dylib"]
-#![crate_type = "rlib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
       html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
       html_root_url = "https://doc.rust-lang.org/nightly/")]
@@ -87,7 +86,6 @@ This API is completely unstable and subject to change.
 extern crate syntax_pos;
 
 extern crate arena;
-extern crate fmt_macros;
 #[macro_use] extern crate rustc;
 extern crate rustc_platform_intrinsics as intrinsics;
 extern crate rustc_back;
@@ -95,12 +93,11 @@ extern crate rustc_const_math;
 extern crate rustc_data_structures;
 extern crate rustc_errors as errors;
 
-pub use rustc::dep_graph;
-pub use rustc::hir;
-pub use rustc::lint;
-pub use rustc::middle;
-pub use rustc::session;
-pub use rustc::util;
+use rustc::hir;
+use rustc::lint;
+use rustc::middle;
+use rustc::session;
+use rustc::util;
 
 use hir::map as hir_map;
 use rustc::infer::InferOk;
@@ -118,7 +115,7 @@ use syntax_pos::Span;
 use std::iter;
 // NB: This module needs to be declared first so diagnostics are
 // registered before they are used.
-pub mod diagnostics;
+mod diagnostics;
 
 mod check;
 mod check_unused;
@@ -127,11 +124,13 @@ mod collect;
 mod constrained_type_params;
 mod impl_wf_check;
 mod coherence;
+mod outlives;
 mod variance;
+mod namespace;
 
 pub struct TypeAndSubsts<'tcx> {
-    pub substs: &'tcx Substs<'tcx>,
-    pub ty: Ty<'tcx>,
+    substs: &'tcx Substs<'tcx>,
+    ty: Ty<'tcx>,
 }
 
 fn require_c_abi_if_variadic(tcx: TyCtxt,
@@ -290,6 +289,7 @@ pub fn provide(providers: &mut Providers) {
     coherence::provide(providers);
     check::provide(providers);
     variance::provide(providers);
+    outlives::provide(providers);
 }
 
 pub fn check_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>)
@@ -303,6 +303,11 @@ pub fn check_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>)
         time(time_passes, "type collecting", ||
              collect::collect_item_types(tcx));
 
+    })?;
+
+    tcx.sess.track_errors(|| {
+        time(time_passes, "outlives testing", ||
+            outlives::test::test_inferred_outlives(tcx));
     })?;
 
     tcx.sess.track_errors(|| {

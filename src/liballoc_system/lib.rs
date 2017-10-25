@@ -8,20 +8,21 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-#![crate_name = "alloc_system"]
-#![crate_type = "rlib"]
 #![no_std]
+#![allow(unused_attributes)]
 #![deny(warnings)]
 #![unstable(feature = "alloc_system",
             reason = "this library is unlikely to be stabilized in its current \
                       form or name",
-            issue = "27783")]
+            issue = "32838")]
 #![feature(global_allocator)]
 #![feature(allocator_api)]
 #![feature(alloc)]
 #![feature(core_intrinsics)]
 #![feature(staged_api)]
+#![feature(rustc_attrs)]
 #![cfg_attr(any(unix, target_os = "redox"), feature(libc))]
+#![rustc_alloc_kind = "lib"]
 
 // The minimum alignment guaranteed by the architecture. This value is used to
 // add fast paths for low alignment values. In practice, the alignment is a
@@ -223,7 +224,7 @@ mod platform {
         }
     }
 
-    #[cfg(any(target_os = "android", target_os = "redox"))]
+    #[cfg(any(target_os = "android", target_os = "redox", target_os = "solaris"))]
     #[inline]
     unsafe fn aligned_malloc(layout: &Layout) -> *mut u8 {
         // On android we currently target API level 9 which unfortunately
@@ -246,7 +247,7 @@ mod platform {
         libc::memalign(layout.align(), layout.size()) as *mut u8
     }
 
-    #[cfg(not(any(target_os = "android", target_os = "redox")))]
+    #[cfg(not(any(target_os = "android", target_os = "redox", target_os = "solaris")))]
     #[inline]
     unsafe fn aligned_malloc(layout: &Layout) -> *mut u8 {
         let mut out = ptr::null_mut();

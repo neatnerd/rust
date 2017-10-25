@@ -23,7 +23,7 @@ use std::path::{PathBuf, Path};
 use std::process::Command;
 use std::io::Read;
 
-use build_helper::{self, output};
+use build_helper::{self, output, BuildExpectation};
 
 use builder::{Kind, RunConfig, ShouldRun, Builder, Compiler, Step};
 use cache::{INTERNER, Interned};
@@ -33,6 +33,7 @@ use native;
 use tool::{self, Tool};
 use util::{self, dylib_path, dylib_path_var};
 use {Build, Mode};
+use toolstate::ToolState;
 
 const ADB_TEST_DIR: &str = "/data/tmp/work";
 
@@ -64,22 +65,26 @@ impl fmt::Display for TestKind {
     }
 }
 
-fn try_run(build: &Build, cmd: &mut Command) {
+fn try_run_expecting(build: &Build, cmd: &mut Command, expect: BuildExpectation) {
     if !build.fail_fast {
-        if !build.try_run(cmd) {
-            let failures = build.delayed_failures.get();
-            build.delayed_failures.set(failures + 1);
+        if !build.try_run(cmd, expect) {
+            let mut failures = build.delayed_failures.borrow_mut();
+            failures.push(format!("{:?}", cmd));
         }
     } else {
-        build.run(cmd);
+        build.run_expecting(cmd, expect);
     }
+}
+
+fn try_run(build: &Build, cmd: &mut Command) {
+    try_run_expecting(build, cmd, BuildExpectation::None)
 }
 
 fn try_run_quiet(build: &Build, cmd: &mut Command) {
     if !build.fail_fast {
         if !build.try_run_quiet(cmd) {
-            let failures = build.delayed_failures.get();
-            build.delayed_failures.set(failures + 1);
+            let mut failures = build.delayed_failures.borrow_mut();
+            failures.push(format!("{:?}", cmd));
         }
     } else {
         build.run_quiet(cmd);
@@ -164,7 +169,7 @@ impl Step for Cargotest {
         try_run(build, cmd.arg(&build.initial_cargo)
                           .arg(&out_dir)
                           .env("RUSTC", builder.rustc(compiler))
-                          .env("RUSTDOC", builder.rustdoc(compiler)));
+                          .env("RUSTDOC", builder.rustdoc(compiler.host)));
     }
 }
 
@@ -241,15 +246,175 @@ impl Step for Rls {
         let compiler = builder.compiler(stage, host);
 
         builder.ensure(tool::Rls { compiler, target: self.host });
-        let mut cargo = builder.cargo(compiler, Mode::Tool, host, "test");
-        cargo.arg("--manifest-path").arg(build.src.join("src/tools/rls/Cargo.toml"));
+        let mut cargo = tool::prepare_tool_cargo(builder,
+                                                 compiler,
+                                                 host,
+                                                 "test",
+                                                 "src/tools/rls");
 
         // Don't build tests dynamically, just a pain to work with
         cargo.env("RUSTC_NO_PREFER_DYNAMIC", "1");
 
         builder.add_rustc_lib_path(compiler, &mut cargo);
 
-        try_run(build, &mut cargo);
+        try_run_expecting(
+            build,
+            &mut cargo,
+            builder.build.config.toolstate.rls.passes(ToolState::Testing),
+        );
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct Rustfmt {
+    stage: u32,
+    host: Interned<String>,
+}
+
+impl Step for Rustfmt {
+    type Output = ();
+    const ONLY_HOSTS: bool = true;
+
+    fn should_run(run: ShouldRun) -> ShouldRun {
+        run.path("src/tools/rustfmt")
+    }
+
+    fn make_run(run: RunConfig) {
+        run.builder.ensure(Rustfmt {
+            stage: run.builder.top_stage,
+            host: run.target,
+        });
+    }
+
+    /// Runs `cargo test` for rustfmt.
+    fn run(self, builder: &Builder) {
+        let build = builder.build;
+        let stage = self.stage;
+        let host = self.host;
+        let compiler = builder.compiler(stage, host);
+
+        builder.ensure(tool::Rustfmt { compiler, target: self.host });
+        let mut cargo = tool::prepare_tool_cargo(builder,
+                                                 compiler,
+                                                 host,
+                                                 "test",
+                                                 "src/tools/rustfmt");
+
+        // Don't build tests dynamically, just a pain to work with
+        cargo.env("RUSTC_NO_PREFER_DYNAMIC", "1");
+
+        builder.add_rustc_lib_path(compiler, &mut cargo);
+
+        try_run_expecting(
+            build,
+            &mut cargo,
+            builder.build.config.toolstate.rustfmt.passes(ToolState::Testing),
+        );
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct Miri {
+    host: Interned<String>,
+}
+
+impl Step for Miri {
+    type Output = ();
+    const ONLY_HOSTS: bool = true;
+    const DEFAULT: bool = true;
+
+    fn should_run(run: ShouldRun) -> ShouldRun {
+        let test_miri = run.builder.build.config.test_miri;
+        run.path("src/tools/miri").default_condition(test_miri)
+    }
+
+    fn make_run(run: RunConfig) {
+        run.builder.ensure(Miri {
+            host: run.target,
+        });
+    }
+
+    /// Runs `cargo test` for miri.
+    fn run(self, builder: &Builder) {
+        let build = builder.build;
+        let host = self.host;
+        let compiler = builder.compiler(1, host);
+
+        if let Some(miri) = builder.ensure(tool::Miri { compiler, target: self.host }) {
+            let mut cargo = builder.cargo(compiler, Mode::Tool, host, "test");
+            cargo.arg("--manifest-path").arg(build.src.join("src/tools/miri/Cargo.toml"));
+
+            // Don't build tests dynamically, just a pain to work with
+            cargo.env("RUSTC_NO_PREFER_DYNAMIC", "1");
+            // miri tests need to know about the stage sysroot
+            cargo.env("MIRI_SYSROOT", builder.sysroot(compiler));
+            cargo.env("RUSTC_TEST_SUITE", builder.rustc(compiler));
+            cargo.env("RUSTC_LIB_PATH", builder.rustc_libdir(compiler));
+            cargo.env("MIRI_PATH", miri);
+
+            builder.add_rustc_lib_path(compiler, &mut cargo);
+
+            try_run_expecting(
+                build,
+                &mut cargo,
+                builder.build.config.toolstate.miri.passes(ToolState::Testing),
+            );
+        } else {
+            eprintln!("failed to test miri: could not build");
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct Clippy {
+    stage: u32,
+    host: Interned<String>,
+}
+
+impl Step for Clippy {
+    type Output = ();
+    const ONLY_HOSTS: bool = true;
+    const DEFAULT: bool = false;
+
+    fn should_run(run: ShouldRun) -> ShouldRun {
+        run.path("src/tools/clippy")
+    }
+
+    fn make_run(run: RunConfig) {
+        run.builder.ensure(Clippy {
+            stage: run.builder.top_stage,
+            host: run.target,
+        });
+    }
+
+    /// Runs `cargo test` for clippy.
+    fn run(self, builder: &Builder) {
+        let build = builder.build;
+        let stage = self.stage;
+        let host = self.host;
+        let compiler = builder.compiler(stage, host);
+
+        if let Some(clippy) = builder.ensure(tool::Clippy { compiler, target: self.host }) {
+            let mut cargo = builder.cargo(compiler, Mode::Tool, host, "test");
+            cargo.arg("--manifest-path").arg(build.src.join("src/tools/clippy/Cargo.toml"));
+
+            // Don't build tests dynamically, just a pain to work with
+            cargo.env("RUSTC_NO_PREFER_DYNAMIC", "1");
+            // clippy tests need to know about the stage sysroot
+            cargo.env("SYSROOT", builder.sysroot(compiler));
+            // clippy tests need to find the driver
+            cargo.env("CLIPPY_DRIVER_PATH", clippy);
+
+            builder.add_rustc_lib_path(compiler, &mut cargo);
+
+            try_run_expecting(
+                build,
+                &mut cargo,
+                builder.build.config.toolstate.clippy.passes(ToolState::Testing),
+            );
+        } else {
+            eprintln!("failed to test clippy: could not build");
+        }
     }
 }
 
@@ -565,7 +730,7 @@ impl Step for Compiletest {
 
         // Avoid depending on rustdoc when we don't need it.
         if mode == "rustdoc" || mode == "run-make" {
-            cmd.arg("--rustdoc-path").arg(builder.rustdoc(compiler));
+            cmd.arg("--rustdoc-path").arg(builder.rustdoc(compiler.host));
         }
 
         cmd.arg("--src-base").arg(build.src.join("src/test").join(suite));
@@ -588,12 +753,14 @@ impl Step for Compiletest {
             flags.push("-g".to_string());
         }
 
-        let mut hostflags = build.rustc_flags(compiler.host);
-        hostflags.extend(flags.clone());
+        if let Some(linker) = build.linker(target) {
+            cmd.arg("--linker").arg(linker);
+        }
+
+        let hostflags = flags.clone();
         cmd.arg("--host-rustcflags").arg(hostflags.join(" "));
 
-        let mut targetflags = build.rustc_flags(target);
-        targetflags.extend(flags);
+        let mut targetflags = flags.clone();
         targetflags.push(format!("-Lnative={}",
                                  build.test_helpers_out(target).display()));
         cmd.arg("--target-rustcflags").arg(targetflags.join(" "));
@@ -618,14 +785,8 @@ impl Step for Compiletest {
         if let Some(ref dir) = build.lldb_python_dir {
             cmd.arg("--lldb-python-dir").arg(dir);
         }
-        let llvm_config = build.llvm_config(target);
-        let llvm_version = output(Command::new(&llvm_config).arg("--version"));
-        cmd.arg("--llvm-version").arg(llvm_version);
-        if !build.is_rust_llvm(target) {
-            cmd.arg("--system-llvm");
-        }
 
-        cmd.args(&build.flags.cmd.test_args());
+        cmd.args(&build.config.cmd.test_args());
 
         if build.is_verbose() {
             cmd.arg("--verbose");
@@ -635,17 +796,35 @@ impl Step for Compiletest {
             cmd.arg("--quiet");
         }
 
-        // Only pass correct values for these flags for the `run-make` suite as it
-        // requires that a C++ compiler was configured which isn't always the case.
-        if suite == "run-make" {
-            let llvm_components = output(Command::new(&llvm_config).arg("--components"));
-            let llvm_cxxflags = output(Command::new(&llvm_config).arg("--cxxflags"));
-            cmd.arg("--cc").arg(build.cc(target))
-               .arg("--cxx").arg(build.cxx(target).unwrap())
-               .arg("--cflags").arg(build.cflags(target).join(" "))
-               .arg("--llvm-components").arg(llvm_components.trim())
-               .arg("--llvm-cxxflags").arg(llvm_cxxflags.trim());
-        } else {
+        if build.config.llvm_enabled {
+            let llvm_config = build.llvm_config(target);
+            let llvm_version = output(Command::new(&llvm_config).arg("--version"));
+            cmd.arg("--llvm-version").arg(llvm_version);
+            if !build.is_rust_llvm(target) {
+                cmd.arg("--system-llvm");
+            }
+
+            // Only pass correct values for these flags for the `run-make` suite as it
+            // requires that a C++ compiler was configured which isn't always the case.
+            if suite == "run-make" {
+                let llvm_components = output(Command::new(&llvm_config).arg("--components"));
+                let llvm_cxxflags = output(Command::new(&llvm_config).arg("--cxxflags"));
+                cmd.arg("--cc").arg(build.cc(target))
+                .arg("--cxx").arg(build.cxx(target).unwrap())
+                .arg("--cflags").arg(build.cflags(target).join(" "))
+                .arg("--llvm-components").arg(llvm_components.trim())
+                .arg("--llvm-cxxflags").arg(llvm_cxxflags.trim());
+                if let Some(ar) = build.ar(target) {
+                    cmd.arg("--ar").arg(ar);
+                }
+            }
+        }
+        if suite == "run-make" && !build.config.llvm_enabled {
+            println!("Ignoring run-make test suite as they generally dont work without LLVM");
+            return;
+        }
+
+        if suite != "run-make" {
             cmd.arg("--cc").arg("")
                .arg("--cxx").arg("")
                .arg("--cflags").arg("")
@@ -663,7 +842,7 @@ impl Step for Compiletest {
         // Note that if we encounter `PATH` we make sure to append to our own `PATH`
         // rather than stomp over it.
         if target.contains("msvc") {
-            for &(ref k, ref v) in build.cc[&target].0.env() {
+            for &(ref k, ref v) in build.cc[&target].env() {
                 if k != "PATH" {
                     cmd.env(k, v);
                 }
@@ -814,13 +993,13 @@ fn markdown_test(builder: &Builder, compiler: Compiler, markdown: &Path) {
     }
 
     println!("doc tests for: {}", markdown.display());
-    let mut cmd = builder.rustdoc_cmd(compiler);
+    let mut cmd = builder.rustdoc_cmd(compiler.host);
     build.add_rust_test_threads(&mut cmd);
     cmd.arg("--test");
     cmd.arg(markdown);
     cmd.env("RUSTC_BOOTSTRAP", "1");
 
-    let test_args = build.flags.cmd.test_args().join(" ");
+    let test_args = build.config.cmd.test_args().join(" ");
     cmd.arg("--test-args").arg(test_args);
 
     if build.config.quiet_tests {
@@ -863,7 +1042,7 @@ impl Step for CrateLibrustc {
             builder.ensure(CrateLibrustc {
                 compiler,
                 target: run.target,
-                test_kind: test_kind,
+                test_kind,
                 krate: name,
             });
         };
@@ -890,7 +1069,6 @@ impl Step for CrateLibrustc {
         });
     }
 }
-
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct Crate {
@@ -925,8 +1103,8 @@ impl Step for Crate {
             builder.ensure(Crate {
                 compiler,
                 target: run.target,
-                mode: mode,
-                test_kind: test_kind,
+                mode,
+                test_kind,
                 krate: name,
             });
         };
@@ -1051,7 +1229,7 @@ impl Step for Crate {
         cargo.env(dylib_path_var(), env::join_paths(&dylib_path).unwrap());
 
         cargo.arg("--");
-        cargo.args(&build.flags.cmd.test_args());
+        cargo.args(&build.config.cmd.test_args());
 
         if build.config.quiet_tests {
             cargo.arg("--quiet");
@@ -1067,6 +1245,75 @@ impl Step for Crate {
                       format!("{} run",
                               builder.tool_exe(Tool::RemoteTestClient).display()));
         }
+        try_run(build, &mut cargo);
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct Rustdoc {
+    host: Interned<String>,
+    test_kind: TestKind,
+}
+
+impl Step for Rustdoc {
+    type Output = ();
+    const DEFAULT: bool = true;
+    const ONLY_HOSTS: bool = true;
+
+    fn should_run(run: ShouldRun) -> ShouldRun {
+        run.path("src/librustdoc").path("src/tools/rustdoc")
+    }
+
+    fn make_run(run: RunConfig) {
+        let builder = run.builder;
+
+        let test_kind = if builder.kind == Kind::Test {
+            TestKind::Test
+        } else if builder.kind == Kind::Bench {
+            TestKind::Bench
+        } else {
+            panic!("unexpected builder.kind in crate: {:?}", builder.kind);
+        };
+
+        builder.ensure(Rustdoc {
+            host: run.host,
+            test_kind,
+        });
+    }
+
+    fn run(self, builder: &Builder) {
+        let build = builder.build;
+        let test_kind = self.test_kind;
+
+        let compiler = builder.compiler(builder.top_stage, self.host);
+        let target = compiler.host;
+
+        let mut cargo = tool::prepare_tool_cargo(builder,
+                                                 compiler,
+                                                 target,
+                                                 test_kind.subcommand(),
+                                                 "src/tools/rustdoc");
+        let _folder = build.fold_output(|| {
+            format!("{}_stage{}-rustdoc", test_kind.subcommand(), compiler.stage)
+        });
+        println!("{} rustdoc stage{} ({} -> {})", test_kind, compiler.stage,
+                &compiler.host, target);
+
+        if test_kind.subcommand() == "test" && !build.fail_fast {
+            cargo.arg("--no-fail-fast");
+        }
+
+        cargo.arg("-p").arg("rustdoc:0.0.0");
+
+        cargo.arg("--");
+        cargo.args(&build.config.cmd.test_args());
+
+        if build.config.quiet_tests {
+            cargo.arg("--quiet");
+        }
+
+        let _time = util::timeit();
+
         try_run(build, &mut cargo);
     }
 }
@@ -1147,6 +1394,7 @@ pub struct Distcheck;
 
 impl Step for Distcheck {
     type Output = ();
+    const ONLY_BUILD: bool = true;
 
     fn should_run(run: ShouldRun) -> ShouldRun {
         run.path("distcheck")
@@ -1159,16 +1407,6 @@ impl Step for Distcheck {
     /// Run "distcheck", a 'make check' from a tarball
     fn run(self, builder: &Builder) {
         let build = builder.build;
-
-        if *build.build != *"x86_64-unknown-linux-gnu" {
-            return
-        }
-        if !build.config.host.iter().any(|s| s == "x86_64-unknown-linux-gnu") {
-            return
-        }
-        if !build.config.target.iter().any(|s| s == "x86_64-unknown-linux-gnu") {
-            return
-        }
 
         println!("Distcheck");
         let dir = build.out.join("tmp").join("distcheck");
@@ -1236,7 +1474,7 @@ impl Step for Bootstrap {
         if !build.fail_fast {
             cmd.arg("--no-fail-fast");
         }
-        cmd.arg("--").args(&build.flags.cmd.test_args());
+        cmd.arg("--").args(&build.config.cmd.test_args());
         try_run(build, &mut cmd);
     }
 

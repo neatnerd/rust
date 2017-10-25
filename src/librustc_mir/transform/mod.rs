@@ -13,7 +13,7 @@ use rustc::hir::def_id::{CrateNum, DefId, LOCAL_CRATE};
 use rustc::mir::Mir;
 use rustc::mir::transform::{MirPassIndex, MirSuite, MirSource,
                             MIR_CONST, MIR_VALIDATED, MIR_OPTIMIZED};
-use rustc::ty::{self, TyCtxt};
+use rustc::ty::TyCtxt;
 use rustc::ty::maps::Providers;
 use rustc::ty::steal::Steal;
 use rustc::hir;
@@ -21,10 +21,12 @@ use rustc::hir::intravisit::{self, Visitor, NestedVisitorMap};
 use rustc::util::nodemap::DefIdSet;
 use std::rc::Rc;
 use syntax::ast;
-use syntax_pos::{DUMMY_SP, Span};
+use syntax_pos::Span;
 use transform;
 
+pub mod add_validation;
 pub mod clean_end_regions;
+pub mod check_unsafety;
 pub mod simplify_branches;
 pub mod simplify;
 pub mod erase_regions;
@@ -39,11 +41,13 @@ pub mod dump_mir;
 pub mod deaggregator;
 pub mod instcombine;
 pub mod copy_prop;
+pub mod generator;
 pub mod inline;
 pub mod nll;
 
 pub(crate) fn provide(providers: &mut Providers) {
     self::qualify_consts::provide(providers);
+    self::check_unsafety::provide(providers);
     *providers = Providers {
         mir_keys,
         mir_const,
@@ -92,7 +96,7 @@ fn mir_keys<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, krate: CrateNum)
         }
     }
     tcx.hir.krate().visit_all_item_likes(&mut GatherCtors {
-        tcx: tcx,
+        tcx,
         set: &mut set,
     }.as_deep_visitor());
 
@@ -110,10 +114,10 @@ fn mir_validated<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, def_id: DefId) -> &'tcx 
     let source = MirSource::from_local_def_id(tcx, def_id);
     if let MirSource::Const(_) = source {
         // Ensure that we compute the `mir_const_qualif` for constants at
-        // this point, before we steal the mir-const result. We don't
-        // directly need the result or `mir_const_qualif`, so we can just force it.
-        ty::queries::mir_const_qualif::force(tcx, DUMMY_SP, def_id);
+        // this point, before we steal the mir-const result.
+        let _ = tcx.mir_const_qualif(def_id);
     }
+    let _ = tcx.unsafety_violations(def_id);
 
     let mut mir = tcx.mir_const(def_id).steal();
     transform::run_suite(tcx, source, MIR_VALIDATED, &mut mir);
@@ -121,9 +125,10 @@ fn mir_validated<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, def_id: DefId) -> &'tcx 
 }
 
 fn optimized_mir<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, def_id: DefId) -> &'tcx Mir<'tcx> {
-    // Borrowck uses `mir_validated`, so we have to force it to
+    // (Mir-)Borrowck uses `mir_validated`, so we have to force it to
     // execute before we can steal.
-    ty::queries::borrowck::force(tcx, DUMMY_SP, def_id);
+    let _ = tcx.mir_borrowck(def_id);
+    let _ = tcx.borrowck(def_id);
 
     let mut mir = tcx.mir_validated(def_id).steal();
     let source = MirSource::from_local_def_id(tcx, def_id);
@@ -146,6 +151,14 @@ fn run_suite<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         }
 
         pass.run_pass(tcx, source, mir);
+
+        for (index, promoted_mir) in mir.promoted.iter_enumerated_mut() {
+            let promoted_source = MirSource::Promoted(source.item_id(), index);
+            pass.run_pass(tcx, promoted_source, promoted_mir);
+
+            // Let's make sure we don't miss any nested instances
+            assert!(promoted_mir.promoted.is_empty());
+        }
 
         for hook in tcx.mir_passes.hooks() {
             hook.on_mir_pass(tcx, suite, pass_num, &pass.name(), source, &mir, true);

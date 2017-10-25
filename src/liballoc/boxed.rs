@@ -62,11 +62,11 @@ use core::any::Any;
 use core::borrow;
 use core::cmp::Ordering;
 use core::fmt;
-use core::hash::{self, Hash};
+use core::hash::{self, Hash, Hasher};
 use core::iter::FusedIterator;
 use core::marker::{self, Unsize};
 use core::mem;
-use core::ops::{CoerceUnsized, Deref, DerefMut};
+use core::ops::{CoerceUnsized, Deref, DerefMut, Generator, GeneratorState};
 use core::ops::{BoxPlace, Boxed, InPlace, Place, Placer};
 use core::ptr::{self, Unique};
 use core::convert::From;
@@ -169,7 +169,7 @@ fn make_place<T>() -> IntermediateBox<T> {
 
     IntermediateBox {
         ptr: p,
-        layout: layout,
+        layout,
         marker: marker::PhantomData,
     }
 }
@@ -269,7 +269,38 @@ impl<T: ?Sized> Box<T> {
     #[stable(feature = "box_raw", since = "1.4.0")]
     #[inline]
     pub unsafe fn from_raw(raw: *mut T) -> Self {
-        mem::transmute(raw)
+        Box::from_unique(Unique::new_unchecked(raw))
+    }
+
+    /// Constructs a `Box` from a `Unique<T>` pointer.
+    ///
+    /// After calling this function, the memory is owned by a `Box` and `T` can
+    /// then be destroyed and released upon drop.
+    ///
+    /// # Safety
+    ///
+    /// A `Unique<T>` can be safely created via [`Unique::new`] and thus doesn't
+    /// necessarily own the data pointed to nor is the data guaranteed to live
+    /// as long as the pointer.
+    ///
+    /// [`Unique::new`]: ../../core/ptr/struct.Unique.html#method.new
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(unique)]
+    ///
+    /// fn main() {
+    ///     let x = Box::new(5);
+    ///     let ptr = Box::into_unique(x);
+    ///     let x = unsafe { Box::from_unique(ptr) };
+    /// }
+    /// ```
+    #[unstable(feature = "unique", reason = "needs an RFC to flesh out design",
+               issue = "27730")]
+    #[inline]
+    pub unsafe fn from_unique(u: Unique<T>) -> Self {
+        mem::transmute(u)
     }
 
     /// Consumes the `Box`, returning the wrapped raw pointer.
@@ -295,7 +326,7 @@ impl<T: ?Sized> Box<T> {
     #[stable(feature = "box_raw", since = "1.4.0")]
     #[inline]
     pub fn into_raw(b: Box<T>) -> *mut T {
-        unsafe { mem::transmute(b) }
+        Box::into_unique(b).as_ptr()
     }
 
     /// Consumes the `Box`, returning the wrapped pointer as `Unique<T>`.
@@ -303,13 +334,18 @@ impl<T: ?Sized> Box<T> {
     /// After calling this function, the caller is responsible for the
     /// memory previously managed by the `Box`. In particular, the
     /// caller should properly destroy `T` and release the memory. The
-    /// proper way to do so is to convert the raw pointer back into a
-    /// `Box` with the [`Box::from_raw`] function.
+    /// proper way to do so is to either convert the `Unique<T>` pointer:
+    ///
+    /// - Into a `Box` with the [`Box::from_unique`] function.
+    ///
+    /// - Into a raw pointer and back into a `Box` with the [`Box::from_raw`]
+    ///   function.
     ///
     /// Note: this is an associated function, which means that you have
     /// to call it as `Box::into_unique(b)` instead of `b.into_unique()`. This
     /// is so that there is no conflict with a method on the inner type.
     ///
+    /// [`Box::from_unique`]: struct.Box.html#method.from_unique
     /// [`Box::from_raw`]: struct.Box.html#method.from_raw
     ///
     /// # Examples
@@ -456,6 +492,52 @@ impl<T: ?Sized + Hash> Hash for Box<T> {
     }
 }
 
+#[stable(feature = "indirect_hasher_impl", since = "1.22.0")]
+impl<T: ?Sized + Hasher> Hasher for Box<T> {
+    fn finish(&self) -> u64 {
+        (**self).finish()
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        (**self).write(bytes)
+    }
+    fn write_u8(&mut self, i: u8) {
+        (**self).write_u8(i)
+    }
+    fn write_u16(&mut self, i: u16) {
+        (**self).write_u16(i)
+    }
+    fn write_u32(&mut self, i: u32) {
+        (**self).write_u32(i)
+    }
+    fn write_u64(&mut self, i: u64) {
+        (**self).write_u64(i)
+    }
+    fn write_u128(&mut self, i: u128) {
+        (**self).write_u128(i)
+    }
+    fn write_usize(&mut self, i: usize) {
+        (**self).write_usize(i)
+    }
+    fn write_i8(&mut self, i: i8) {
+        (**self).write_i8(i)
+    }
+    fn write_i16(&mut self, i: i16) {
+        (**self).write_i16(i)
+    }
+    fn write_i32(&mut self, i: i32) {
+        (**self).write_i32(i)
+    }
+    fn write_i64(&mut self, i: i64) {
+        (**self).write_i64(i)
+    }
+    fn write_i128(&mut self, i: i128) {
+        (**self).write_i128(i)
+    }
+    fn write_isize(&mut self, i: isize) {
+        (**self).write_isize(i)
+    }
+}
+
 #[stable(feature = "from_for_ptrs", since = "1.6.0")]
 impl<T> From<T> for Box<T> {
     fn from(t: T) -> Self {
@@ -482,9 +564,7 @@ impl<'a> From<&'a str> for Box<str> {
 #[stable(feature = "boxed_str_conv", since = "1.19.0")]
 impl From<Box<str>> for Box<[u8]> {
     fn from(s: Box<str>) -> Self {
-        unsafe {
-            mem::transmute(s)
-        }
+        unsafe { Box::from_raw(Box::into_raw(s) as *mut [u8]) }
     }
 }
 
@@ -633,7 +713,7 @@ impl<I: FusedIterator + ?Sized> FusedIterator for Box<I> {}
 /// that `FnBox` may be deprecated in the future if `Box<FnOnce()>`
 /// closures become directly usable.)
 ///
-/// ### Example
+/// # Examples
 ///
 /// Here is a snippet of code which creates a hashmap full of boxed
 /// once closures and then removes them one by one, calling each
@@ -782,5 +862,16 @@ impl<T: ?Sized> AsRef<T> for Box<T> {
 impl<T: ?Sized> AsMut<T> for Box<T> {
     fn as_mut(&mut self) -> &mut T {
         &mut **self
+    }
+}
+
+#[unstable(feature = "generator_trait", issue = "43122")]
+impl<T> Generator for Box<T>
+    where T: Generator + ?Sized
+{
+    type Yield = T::Yield;
+    type Return = T::Return;
+    fn resume(&mut self) -> GeneratorState<Self::Yield, Self::Return> {
+        (**self).resume()
     }
 }

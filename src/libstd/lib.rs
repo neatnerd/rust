@@ -81,7 +81,7 @@
 //! Note the documentation for the primitives [`str`] and [`[T]`][slice] (also
 //! called 'slice'). Many method calls on [`String`] and [`Vec<T>`] are actually
 //! calls to methods on [`str`] and [`[T]`][slice] respectively, via [deref
-//! coercions].
+//! coercions][deref-coercions].
 //!
 //! Third, the standard library defines [The Rust Prelude], a small collection
 //! of items - mostly traits - that are imported into every module of every
@@ -203,16 +203,13 @@
 //! [`use`]: ../book/first-edition/crates-and-modules.html#importing-modules-with-use
 //! [crate root]: ../book/first-edition/crates-and-modules.html#basic-terminology-crates-and-modules
 //! [crates.io]: https://crates.io
-//! [deref coercions]: ../book/first-edition/deref-coercions.html
+//! [deref-coercions]: ../book/second-edition/ch15-02-deref.html#implicit-deref-coercions-with-functions-and-methods
 //! [files]: fs/struct.File.html
 //! [multithreading]: thread/index.html
 //! [other]: #what-is-in-the-standard-library-documentation
 //! [primitive types]: ../book/first-edition/primitive-types.html
 
-#![crate_name = "std"]
 #![stable(feature = "rust1", since = "1.0.0")]
-#![crate_type = "rlib"]
-#![crate_type = "dylib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
        html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
        html_root_url = "https://doc.rust-lang.org/nightly/",
@@ -243,8 +240,11 @@
 #![feature(allocator_api)]
 #![feature(alloc_system)]
 #![feature(allocator_internals)]
+#![feature(allow_internal_unsafe)]
 #![feature(allow_internal_unstable)]
+#![feature(align_offset)]
 #![feature(asm)]
+#![feature(attr_literals)]
 #![feature(box_syntax)]
 #![feature(cfg_target_has_atomic)]
 #![feature(cfg_target_thread_local)]
@@ -278,7 +278,6 @@
 #![feature(macro_reexport)]
 #![feature(macro_vis_matcher)]
 #![feature(needs_panic_runtime)]
-#![feature(needs_drop)]
 #![feature(never_type)]
 #![feature(num_bits_bytes)]
 #![feature(old_wrapping)]
@@ -292,8 +291,10 @@
 #![feature(prelude_import)]
 #![feature(rand)]
 #![feature(raw)]
+#![feature(repr_align)]
 #![feature(repr_simd)]
 #![feature(rustc_attrs)]
+#![cfg_attr(not(stage0), feature(rustc_const_unstable))]
 #![feature(shared)]
 #![feature(sip_hash_13)]
 #![feature(slice_bytes)]
@@ -314,9 +315,36 @@
 #![feature(untagged_unions)]
 #![feature(unwind_attributes)]
 #![feature(vec_push_all)]
+#![feature(doc_cfg)]
+#![feature(doc_masked)]
 #![cfg_attr(test, feature(update_panic_count))]
 
+#![cfg_attr(not(stage0), feature(const_max_value))]
+#![cfg_attr(not(stage0), feature(const_atomic_bool_new))]
+#![cfg_attr(not(stage0), feature(const_atomic_isize_new))]
+#![cfg_attr(not(stage0), feature(const_atomic_usize_new))]
+#![cfg_attr(all(not(stage0), windows), feature(const_atomic_ptr_new))]
+#![cfg_attr(not(stage0), feature(const_unsafe_cell_new))]
+#![cfg_attr(not(stage0), feature(const_cell_new))]
+#![cfg_attr(not(stage0), feature(const_once_new))]
+#![cfg_attr(not(stage0), feature(const_ptr_null))]
+#![cfg_attr(not(stage0), feature(const_ptr_null_mut))]
+
 #![default_lib_allocator]
+
+// Always use alloc_system during stage0 since we don't know if the alloc_*
+// crate the stage0 compiler will pick by default is enabled (e.g.
+// if the user has disabled jemalloc in `./configure`).
+// `force_alloc_system` is *only* intended as a workaround for local rebuilds
+// with a rustc without jemalloc.
+// FIXME(#44236) shouldn't need MSVC logic
+#![cfg_attr(all(not(target_env = "msvc"),
+                any(stage0, feature = "force_alloc_system")),
+            feature(global_allocator))]
+#[cfg(all(not(target_env = "msvc"),
+          any(stage0, feature = "force_alloc_system")))]
+#[global_allocator]
+static ALLOC: alloc_system::System = alloc_system::System;
 
 // Explicitly import the prelude. The compiler uses this same unstable attribute
 // to import the prelude implicitly when building crates that depend on std.
@@ -334,18 +362,24 @@ use prelude::v1::*;
                  debug_assert_ne, unreachable, unimplemented, write, writeln, try)]
 extern crate core as __core;
 
-#[allow(deprecated)] extern crate rand as core_rand;
+#[doc(masked)]
+#[allow(deprecated)]
+extern crate rand as core_rand;
 #[macro_use]
 #[macro_reexport(vec, format)]
 extern crate alloc;
 extern crate alloc_system;
 extern crate std_unicode;
+#[doc(masked)]
 extern crate libc;
 
 // We always need an unwinder currently for backtraces
+#[doc(masked)]
+#[allow(unused_extern_crates)]
 extern crate unwind;
 
 // compiler-rt intrinsics
+#[doc(masked)]
 extern crate compiler_builtins;
 
 // During testing, this crate is not actually the "real" std library, but rather

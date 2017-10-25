@@ -22,7 +22,6 @@ use std::sync::{Arc, Mutex};
 
 use testing;
 use rustc_lint;
-use rustc::dep_graph::DepGraph;
 use rustc::hir;
 use rustc::hir::intravisit;
 use rustc::session::{self, CompileIncomplete, config};
@@ -32,6 +31,7 @@ use rustc_back::dynamic_lib::DynamicLibrary;
 use rustc_back::tempdir::TempDir;
 use rustc_driver::{self, driver, Compilation};
 use rustc_driver::driver::phase_2_configure_and_expand;
+use rustc_driver::pretty::ReplaceBodyWithLoop;
 use rustc_metadata::cstore::CStore;
 use rustc_resolve::MakeGlobMap;
 use rustc_trans;
@@ -39,6 +39,7 @@ use rustc_trans::back::link;
 use syntax::ast;
 use syntax::codemap::CodeMap;
 use syntax::feature_gate::UnstableFeatures;
+use syntax::fold::Folder;
 use syntax_pos::{BytePos, DUMMY_SP, Pos, Span};
 use errors;
 use errors::emitter::ColorConfig;
@@ -60,7 +61,8 @@ pub fn run(input: &str,
            crate_name: Option<String>,
            maybe_sysroot: Option<PathBuf>,
            render_type: RenderType,
-           display_warnings: bool)
+           display_warnings: bool,
+           linker: Option<String>)
            -> isize {
     let input_path = PathBuf::from(input);
     let input = config::Input::File(input_path.clone());
@@ -72,6 +74,7 @@ pub fn run(input: &str,
         crate_types: vec![config::CrateTypeDylib],
         externs: externs.clone(),
         unstable_features: UnstableFeatures::from_environment(),
+        lint_cap: Some(::rustc::lint::Level::Allow),
         actually_rustdoc: true,
         ..config::basic_options().clone()
     };
@@ -80,21 +83,29 @@ pub fn run(input: &str,
     let handler =
         errors::Handler::with_tty_emitter(ColorConfig::Auto, true, false, Some(codemap.clone()));
 
-    let dep_graph = DepGraph::new(false);
-    let _ignore = dep_graph.in_ignore();
-    let cstore = Rc::new(CStore::new(&dep_graph, box rustc_trans::LlvmMetadataLoader));
+    let cstore = Rc::new(CStore::new(box rustc_trans::LlvmMetadataLoader));
     let mut sess = session::build_session_(
-        sessopts, &dep_graph, Some(input_path.clone()), handler, codemap.clone(), cstore.clone(),
+        sessopts, Some(input_path.clone()), handler, codemap.clone(),
     );
     rustc_trans::init(&sess);
     rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
     sess.parse_sess.config =
         config::build_configuration(&sess, config::parse_cfgspecs(cfgs.clone()));
 
-    let krate = panictry!(driver::phase_1_parse_input(&sess, &input));
+    let krate = panictry!(driver::phase_1_parse_input(&driver::CompileController::basic(),
+                                                      &sess,
+                                                      &input));
+    let krate = ReplaceBodyWithLoop::new().fold_crate(krate);
     let driver::ExpansionResult { defs, mut hir_forest, .. } = {
         phase_2_configure_and_expand(
-            &sess, &cstore, krate, None, "rustdoc-test", None, MakeGlobMap::No, |_| Ok(())
+            &sess,
+            &cstore,
+            krate,
+            None,
+            "rustdoc-test",
+            None,
+            MakeGlobMap::No,
+            |_| Ok(()),
         ).expect("phase_2_configure_and_expand aborted in rustdoc!")
     };
 
@@ -111,14 +122,14 @@ pub fn run(input: &str,
                                        maybe_sysroot,
                                        Some(codemap),
                                        None,
-                                       render_type);
+                                       render_type,
+                                       linker);
 
     {
-        let dep_graph = DepGraph::new(false);
-        let _ignore = dep_graph.in_ignore();
-        let map = hir::map::map_crate(&mut hir_forest, defs);
+        let map = hir::map::map_crate(&sess, &*cstore, &mut hir_forest, &defs);
         let krate = map.krate();
         let mut hir_collector = HirCollector {
+            sess: &sess,
             collector: &mut collector,
             map: &map
         };
@@ -167,16 +178,19 @@ fn scrape_test_config(krate: &::rustc::hir::Crate) -> TestOptions {
     opts
 }
 
-fn runtest(test: &str, cratename: &str, cfgs: Vec<String>, libs: SearchPaths,
-           externs: Externs,
-           should_panic: bool, no_run: bool, as_test_harness: bool,
-           compile_fail: bool, mut error_codes: Vec<String>, opts: &TestOptions,
-           maybe_sysroot: Option<PathBuf>) {
+fn run_test(test: &str, cratename: &str, filename: &str, cfgs: Vec<String>, libs: SearchPaths,
+            externs: Externs,
+            should_panic: bool, no_run: bool, as_test_harness: bool,
+            compile_fail: bool, mut error_codes: Vec<String>, opts: &TestOptions,
+            maybe_sysroot: Option<PathBuf>,
+            linker: Option<String>) {
     // the test harness wants its own `main` & top level functions, so
     // never wrap the test in `fn main() { ... }`
-    let test = maketest(test, Some(cratename), as_test_harness, opts);
+    let test = make_test(test, Some(cratename), as_test_harness, opts);
+    // FIXME(#44940): if doctests ever support path remapping, then this filename
+    // needs to be the result of CodeMap::span_to_unmapped_path
     let input = config::Input::Str {
-        name: driver::anon_src(),
+        name: filename.to_owned(),
         input: test.to_owned(),
     };
     let outputs = OutputTypes::new(&[(OutputType::Exe, None)]);
@@ -187,9 +201,10 @@ fn runtest(test: &str, cratename: &str, cfgs: Vec<String>, libs: SearchPaths,
         search_paths: libs,
         crate_types: vec![config::CrateTypeExecutable],
         output_types: outputs,
-        externs: externs,
+        externs,
         cg: config::CodegenOptions {
             prefer_dynamic: true,
+            linker,
             .. config::basic_codegen_options()
         },
         test: as_test_harness,
@@ -230,10 +245,9 @@ fn runtest(test: &str, cratename: &str, cfgs: Vec<String>, libs: SearchPaths,
     // Compile the code
     let diagnostic_handler = errors::Handler::with_emitter(true, false, box emitter);
 
-    let dep_graph = DepGraph::new(false);
-    let cstore = Rc::new(CStore::new(&dep_graph, box rustc_trans::LlvmMetadataLoader));
+    let cstore = Rc::new(CStore::new(box rustc_trans::LlvmMetadataLoader));
     let mut sess = session::build_session_(
-        sessopts, &dep_graph, None, diagnostic_handler, codemap, cstore.clone(),
+        sessopts, None, diagnostic_handler, codemap,
     );
     rustc_trans::init(&sess);
     rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
@@ -313,8 +327,11 @@ fn runtest(test: &str, cratename: &str, cfgs: Vec<String>, libs: SearchPaths,
     }
 }
 
-pub fn maketest(s: &str, cratename: Option<&str>, dont_insert_main: bool,
-                opts: &TestOptions) -> String {
+pub fn make_test(s: &str,
+                 cratename: Option<&str>,
+                 dont_insert_main: bool,
+                 opts: &TestOptions)
+                 -> String {
     let (crate_attrs, everything_else) = partition_source(s);
 
     let mut prog = String::new();
@@ -337,7 +354,21 @@ pub fn maketest(s: &str, cratename: Option<&str>, dont_insert_main: bool,
             }
         }
     }
-    if dont_insert_main || s.contains("fn main") {
+
+    // FIXME (#21299): prefer libsyntax or some other actual parser over this
+    // best-effort ad hoc approach
+    let already_has_main = s.lines()
+        .map(|line| {
+            let comment = line.find("//");
+            if let Some(comment_begins) = comment {
+                &line[0..comment_begins]
+            } else {
+                line
+            }
+        })
+        .any(|code| code.contains("fn main"));
+
+    if dont_insert_main || already_has_main {
         prog.push_str(&everything_else);
     } else {
         prog.push_str("fn main() {\n");
@@ -380,13 +411,33 @@ pub struct Collector {
     pub tests: Vec<testing::TestDescAndFn>,
     // to be removed when hoedown will be definitely gone
     pub old_tests: HashMap<String, Vec<String>>,
+
+    // The name of the test displayed to the user, separated by `::`.
+    //
+    // In tests from Rust source, this is the path to the item
+    // e.g. `["std", "vec", "Vec", "push"]`.
+    //
+    // In tests from a markdown file, this is the titles of all headers (h1~h6)
+    // of the sections that contain the code block, e.g. if the markdown file is
+    // written as:
+    //
+    // ``````markdown
+    // # Title
+    //
+    // ## Subtitle
+    //
+    // ```rust
+    // assert!(true);
+    // ```
+    // ``````
+    //
+    // the `names` vector of that test will be `["Title", "Subtitle"]`.
     names: Vec<String>,
+
     cfgs: Vec<String>,
     libs: SearchPaths,
     externs: Externs,
-    cnt: usize,
     use_headers: bool,
-    current_header: Option<String>,
     cratename: String,
     opts: TestOptions,
     maybe_sysroot: Option<PathBuf>,
@@ -395,56 +446,40 @@ pub struct Collector {
     filename: Option<String>,
     // to be removed when hoedown will be removed as well
     pub render_type: RenderType,
+    linker: Option<String>,
 }
 
 impl Collector {
     pub fn new(cratename: String, cfgs: Vec<String>, libs: SearchPaths, externs: Externs,
                use_headers: bool, opts: TestOptions, maybe_sysroot: Option<PathBuf>,
                codemap: Option<Rc<CodeMap>>, filename: Option<String>,
-               render_type: RenderType) -> Collector {
+               render_type: RenderType, linker: Option<String>) -> Collector {
         Collector {
             tests: Vec::new(),
             old_tests: HashMap::new(),
             names: Vec::new(),
-            cfgs: cfgs,
-            libs: libs,
-            externs: externs,
-            cnt: 0,
-            use_headers: use_headers,
-            current_header: None,
-            cratename: cratename,
-            opts: opts,
-            maybe_sysroot: maybe_sysroot,
+            cfgs,
+            libs,
+            externs,
+            use_headers,
+            cratename,
+            opts,
+            maybe_sysroot,
             position: DUMMY_SP,
-            codemap: codemap,
-            filename: filename,
-            render_type: render_type,
+            codemap,
+            filename,
+            render_type,
+            linker,
         }
     }
 
     fn generate_name(&self, line: usize, filename: &str) -> String {
-        if self.use_headers {
-            if let Some(ref header) = self.current_header {
-                format!("{} - {} (line {})", filename, header, line)
-            } else {
-                format!("{} - (line {})", filename, line)
-            }
-        } else {
-            format!("{} - {} (line {})", filename, self.names.join("::"), line)
-        }
+        format!("{} - {} (line {})", filename, self.names.join("::"), line)
     }
 
     // to be removed once hoedown is gone
     fn generate_name_beginning(&self, filename: &str) -> String {
-        if self.use_headers {
-            if let Some(ref header) = self.current_header {
-                format!("{} - {} (line", filename, header)
-            } else {
-                format!("{} - (line", filename)
-            }
-        } else {
-            format!("{} - {} (line", filename, self.names.join("::"))
-        }
+        format!("{} - {} (line", filename, self.names.join("::"))
     }
 
     pub fn add_old_test(&mut self, test: String, filename: String) {
@@ -468,11 +503,10 @@ impl Collector {
                 found = entry.remove_item(&test).is_some();
             }
             if !found {
-                let _ = writeln!(&mut io::stderr(),
-                                 "WARNING: {} Code block is not currently run as a test, but will \
-                                  in future versions of rustdoc. Please ensure this code block is \
-                                  a runnable test, or use the `ignore` directive.",
-                                 name);
+                eprintln!("WARNING: {} Code block is not currently run as a test, but will \
+                           in future versions of rustdoc. Please ensure this code block is \
+                           a runnable test, or use the `ignore` directive.",
+                          name);
                 return
             }
         }
@@ -482,6 +516,7 @@ impl Collector {
         let cratename = self.cratename.to_string();
         let opts = self.opts.clone();
         let maybe_sysroot = self.maybe_sysroot.clone();
+        let linker = self.linker.clone();
         debug!("Creating test {}: {}", name, test);
         self.tests.push(testing::TestDescAndFn {
             desc: testing::TestDesc {
@@ -489,7 +524,7 @@ impl Collector {
                 ignore: should_ignore,
                 // compiler failures are test failures
                 should_panic: testing::ShouldPanic::No,
-                allow_fail: allow_fail,
+                allow_fail,
             },
             testfn: testing::DynTestFn(box move |()| {
                 let panic = io::set_panic(None);
@@ -498,18 +533,20 @@ impl Collector {
                     rustc_driver::in_rustc_thread(move || {
                         io::set_panic(panic);
                         io::set_print(print);
-                        runtest(&test,
-                                &cratename,
-                                cfgs,
-                                libs,
-                                externs,
-                                should_panic,
-                                no_run,
-                                as_test_harness,
-                                compile_fail,
-                                error_codes,
-                                &opts,
-                                maybe_sysroot)
+                        run_test(&test,
+                                 &cratename,
+                                 &filename,
+                                 cfgs,
+                                 libs,
+                                 externs,
+                                 should_panic,
+                                 no_run,
+                                 as_test_harness,
+                                 compile_fail,
+                                 error_codes,
+                                 &opts,
+                                 maybe_sysroot,
+                                 linker)
                     })
                 } {
                     Ok(()) => (),
@@ -521,7 +558,7 @@ impl Collector {
 
     pub fn get_line(&self) -> usize {
         if let Some(ref codemap) = self.codemap {
-            let line = self.position.lo.to_usize();
+            let line = self.position.lo().to_usize();
             let line = codemap.lookup_char_pos(BytePos(line as u32)).line;
             if line > 0 { line - 1 } else { line }
         } else {
@@ -552,7 +589,7 @@ impl Collector {
     }
 
     pub fn register_header(&mut self, name: &str, level: u32) {
-        if self.use_headers && level == 1 {
+        if self.use_headers {
             // we use these headings as test names, so it's good if
             // they're valid identifiers.
             let name = name.chars().enumerate().map(|(i, c)| {
@@ -564,14 +601,34 @@ impl Collector {
                     }
                 }).collect::<String>();
 
-            // new header => reset count.
-            self.cnt = 0;
-            self.current_header = Some(name);
+            // Here we try to efficiently assemble the header titles into the
+            // test name in the form of `h1::h2::h3::h4::h5::h6`.
+            //
+            // Suppose originally `self.names` contains `[h1, h2, h3]`...
+            let level = level as usize;
+            if level <= self.names.len() {
+                // ... Consider `level == 2`. All headers in the lower levels
+                // are irrelevant in this new level. So we should reset
+                // `self.names` to contain headers until <h2>, and replace that
+                // slot with the new name: `[h1, name]`.
+                self.names.truncate(level);
+                self.names[level - 1] = name;
+            } else {
+                // ... On the other hand, consider `level == 5`. This means we
+                // need to extend `self.names` to contain five headers. We fill
+                // in the missing level (<h4>) with `_`. Thus `self.names` will
+                // become `[h1, h2, h3, "_", name]`.
+                if level - 1 > self.names.len() {
+                    self.names.resize(level - 1, "_".to_owned());
+                }
+                self.names.push(name);
+            }
         }
     }
 }
 
 struct HirCollector<'a, 'hir: 'a> {
+    sess: &'a session::Session,
     collector: &'a mut Collector,
     map: &'a hir::map::Map<'hir>
 }
@@ -581,16 +638,21 @@ impl<'a, 'hir> HirCollector<'a, 'hir> {
                                             name: String,
                                             attrs: &[ast::Attribute],
                                             nested: F) {
+        let mut attrs = Attributes::from_ast(self.sess.diagnostic(), attrs);
+        if let Some(ref cfg) = attrs.cfg {
+            if !cfg.matches(&self.sess.parse_sess, Some(&self.sess.features.borrow())) {
+                return;
+            }
+        }
+
         let has_name = !name.is_empty();
         if has_name {
             self.collector.names.push(name);
         }
 
-        let mut attrs = Attributes::from_ast(attrs);
         attrs.collapse_doc_comments();
         attrs.unindent_doc_comments();
         if let Some(doc) = attrs.doc_value() {
-            self.collector.cnt = 0;
             if self.collector.render_type == RenderType::Pulldown {
                 markdown::old_find_testable_code(doc, self.collector,
                                                  attrs.span.unwrap_or(DUMMY_SP));

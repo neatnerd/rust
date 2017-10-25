@@ -103,26 +103,31 @@ mod prim_bool { }
 /// [`String`]: string/struct.String.html
 ///
 /// As always, remember that a human intuition for 'character' may not map to
-/// Unicode's definitions. For example, emoji symbols such as '❤️' can be more
-/// than one Unicode code point; this ❤️ in particular is two:
+/// Unicode's definitions. For example, despite looking similar, the 'é'
+/// character is one Unicode code point while 'é' is two Unicode code points:
 ///
 /// ```
-/// let s = String::from("❤️");
+/// let mut chars = "é".chars();
+/// // U+00e9: 'latin small letter e with acute'
+/// assert_eq!(Some('\u{00e9}'), chars.next());
+/// assert_eq!(None, chars.next());
 ///
-/// // we get two chars out of a single ❤️
-/// let mut iter = s.chars();
-/// assert_eq!(Some('\u{2764}'), iter.next());
-/// assert_eq!(Some('\u{fe0f}'), iter.next());
-/// assert_eq!(None, iter.next());
+/// let mut chars = "é".chars();
+/// // U+0065: 'latin small letter e'
+/// assert_eq!(Some('\u{0065}'), chars.next());
+/// // U+0301: 'combining acute accent'
+/// assert_eq!(Some('\u{0301}'), chars.next());
+/// assert_eq!(None, chars.next());
 /// ```
 ///
-/// This means it won't fit into a `char`. Trying to create a literal with
-/// `let heart = '❤️';` gives an error:
+/// This means that the contents of the first string above _will_ fit into a
+/// `char` while the contents of the second string _will not_. Trying to create
+/// a `char` literal with the contents of the second string gives an error:
 ///
 /// ```text
-/// error: character literal may only contain one codepoint: '❤
-/// let heart = '❤️';
-///             ^~
+/// error: character literal may only contain one codepoint: 'é'
+/// let c = 'é';
+///         ^^^^
 /// ```
 ///
 /// Another implication of the 4-byte fixed size of a `char` is that
@@ -183,9 +188,10 @@ mod prim_unit { }
 /// Working with raw pointers in Rust is uncommon,
 /// typically limited to a few patterns.
 ///
-/// Use the [`null`] function to create null pointers, and the [`is_null`] method
-/// of the `*const T` type  to check for null. The `*const T` type also defines
-/// the [`offset`] method, for pointer math.
+/// Use the [`null`] and [`null_mut`] functions to create null pointers, and the
+/// [`is_null`] method of the `*const T` and `*mut T` types to check for null.
+/// The `*const T` and `*mut T` types also define the [`offset`] method, for
+/// pointer math.
 ///
 /// # Common ways to create raw pointers
 ///
@@ -256,6 +262,7 @@ mod prim_unit { }
 /// *[See also the `std::ptr` module](ptr/index.html).*
 ///
 /// [`null`]: ../std/ptr/fn.null.html
+/// [`null_mut`]: ../std/ptr/fn.null_mut.html
 /// [`is_null`]: ../std/primitive.pointer.html#method.is_null
 /// [`offset`]: ../std/primitive.pointer.html#method.offset
 /// [`into_raw`]: ../std/boxed/struct.Box.html#method.into_raw
@@ -277,7 +284,6 @@ mod prim_pointer { }
 /// Arrays of sizes from 0 to 32 (inclusive) implement the following traits if
 /// the element type allows it:
 ///
-/// - [`Clone`][clone] (only if `T: `[`Copy`][copy])
 /// - [`Debug`][debug]
 /// - [`IntoIterator`][intoiterator] (implemented for `&[T; N]` and `&mut [T; N]`)
 /// - [`PartialEq`][partialeq], [`PartialOrd`][partialord], [`Eq`][eq], [`Ord`][ord]
@@ -292,8 +298,10 @@ mod prim_pointer { }
 /// entirely different types. As a stopgap, trait implementations are
 /// statically generated up to size 32.
 ///
-/// Arrays of *any* size are [`Copy`][copy] if the element type is [`Copy`][copy]. This
-/// works because the [`Copy`][copy] trait is specially known to the compiler.
+/// Arrays of *any* size are [`Copy`][copy] if the element type is [`Copy`][copy]
+/// and [`Clone`][clone] if the element type is [`Clone`][clone]. This works
+/// because [`Copy`][copy] and [`Clone`][clone] traits are specially known
+/// to the compiler.
 ///
 /// Arrays coerce to [slices (`[T]`)][slice], so a slice method may be called on
 /// an array. Indeed, this provides most of the API for working with arrays.
@@ -703,6 +711,10 @@ mod prim_u128 { }
 //
 /// The pointer-sized signed integer type.
 ///
+/// The size of this primitive is how many bytes it takes to reference any
+/// location in memory. For example, on a 32 bit target, this is 4 bytes
+/// and on a 64 bit target, this is 8 bytes.
+///
 /// *[See also the `std::isize` module](isize/index.html).*
 ///
 /// However, please note that examples are shared between primitive integer
@@ -714,6 +726,10 @@ mod prim_isize { }
 #[doc(primitive = "usize")]
 //
 /// The pointer-sized unsigned integer type.
+///
+/// The size of this primitive is how many bytes it takes to reference any
+/// location in memory. For example, on a 32 bit target, this is 4 bytes
+/// and on a 64 bit target, this is 8 bytes.
 ///
 /// *[See also the `std::usize` module](usize/index.html).*
 ///
@@ -906,7 +922,7 @@ mod prim_ref { }
 /// These markers can be combined, so `unsafe extern "stdcall" fn()` is a valid type.
 ///
 /// Like references in rust, function pointers are assumed to not be null, so if you want to pass a
-/// function pointer over FFI and be able to accomodate null pointers, make your type
+/// function pointer over FFI and be able to accommodate null pointers, make your type
 /// `Option<fn()>` with your required signature.
 ///
 /// Function pointers implement the following traits:

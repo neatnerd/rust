@@ -115,6 +115,12 @@ impl Symbol {
     }
 }
 
+impl<'a> From<&'a str> for Symbol {
+    fn from(string: &'a str) -> Symbol {
+        Symbol::intern(string)
+    }
+}
+
 impl fmt::Debug for Symbol {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}({})", self, self.0)
@@ -303,10 +309,11 @@ declare_keywords! {
     (54, Yield,          "yield")
 
     // Weak keywords, have special meaning only in specific contexts.
-    (55, Default,        "default")
-    (56, StaticLifetime, "'static")
-    (57, Union,          "union")
-    (58, Catch,          "catch")
+    (55, Catch,          "catch")
+    (56, Default,        "default")
+    (57, Dyn,            "dyn")
+    (58, StaticLifetime, "'static")
+    (59, Union,          "union")
 }
 
 // If an interner exists in TLS, return it. Otherwise, prepare a fresh one.

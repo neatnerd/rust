@@ -36,12 +36,14 @@ elif [ -f "$docker_dir/disabled/$image/Dockerfile" ]; then
         echo Cannot run disabled images on travis!
         exit 1
     fi
-    retry docker \
+    # retry messes with the pipe from tar to docker. Not needed on non-travis
+    # Transform changes the context of disabled Dockerfiles to match the enabled ones
+    tar --transform 's#^./disabled/#./#' -C $docker_dir -c . | docker \
       build \
       --rm \
       -t rust-ci \
-      -f "$docker_dir/disabled/$image/Dockerfile" \
-      "$docker_dir"
+      -f "$image/Dockerfile" \
+      -
 else
     echo Invalid image: $image
     exit 1
@@ -57,9 +59,10 @@ mkdir -p $objdir/tmp
 
 args=
 if [ "$SCCACHE_BUCKET" != "" ]; then
-    args="$args --env SCCACHE_BUCKET=$SCCACHE_BUCKET"
-    args="$args --env AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID"
-    args="$args --env AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY"
+    args="$args --env SCCACHE_BUCKET"
+    args="$args --env SCCACHE_REGION"
+    args="$args --env AWS_ACCESS_KEY_ID"
+    args="$args --env AWS_SECRET_ACCESS_KEY"
     args="$args --env SCCACHE_ERROR_LOG=/tmp/sccache/sccache.log"
     args="$args --volume $objdir/tmp:/tmp/sccache"
 else
@@ -82,13 +85,14 @@ exec docker \
   --env SRC=/checkout \
   $args \
   --env CARGO_HOME=/cargo \
-  --env DEPLOY=$DEPLOY \
-  --env DEPLOY_ALT=$DEPLOY_ALT \
+  --env DEPLOY \
+  --env DEPLOY_ALT \
   --env LOCAL_USER_ID=`id -u` \
-  --env TRAVIS=${TRAVIS-false} \
+  --env TRAVIS \
   --env TRAVIS_BRANCH \
   --volume "$HOME/.cargo:/cargo" \
   --volume "$HOME/rustsrc:$HOME/rustsrc" \
+  --init \
   --rm \
   rust-ci \
   /checkout/src/ci/run.sh

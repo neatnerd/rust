@@ -27,7 +27,6 @@
 use rustc::hir::def::Def as HirDef;
 use rustc::hir::def_id::DefId;
 use rustc::hir::map::Node;
-use rustc::session::Session;
 use rustc::ty::{self, TyCtxt};
 use rustc_data_structures::fx::FxHashSet;
 
@@ -62,7 +61,6 @@ macro_rules! down_cast_data {
 
 pub struct DumpVisitor<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> {
     save_ctxt: SaveContext<'l, 'tcx>,
-    sess: &'l Session,
     tcx: TyCtxt<'l, 'tcx, 'tcx>,
     dumper: &'ll mut JsonDumper<O>,
 
@@ -84,10 +82,9 @@ impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> DumpVisitor<'l, 'tcx, 'll, O> {
                -> DumpVisitor<'l, 'tcx, 'll, O> {
         let span_utils = SpanUtils::new(&save_ctxt.tcx.sess);
         DumpVisitor {
-            sess: &save_ctxt.tcx.sess,
             tcx: save_ctxt.tcx,
-            save_ctxt: save_ctxt,
-            dumper: dumper,
+            save_ctxt,
+            dumper,
             span: span_utils.clone(),
             cur_scope: CRATE_NODE_ID,
             // mac_defs: HashSet::new(),
@@ -147,39 +144,15 @@ impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> DumpVisitor<'l, 'tcx, 'll, O> {
     // For each prefix, we return the span for the last segment in the prefix and
     // a str representation of the entire prefix.
     fn process_path_prefixes(&self, path: &ast::Path) -> Vec<(Span, String)> {
-        let spans = self.span.spans_for_path_segments(path);
         let segments = &path.segments[if path.is_global() { 1 } else { 0 }..];
 
-        // Paths to enums seem to not match their spans - the span includes all the
-        // variants too. But they seem to always be at the end, so I hope we can cope with
-        // always using the first ones. So, only error out if we don't have enough spans.
-        // What could go wrong...?
-        if spans.len() < segments.len() {
-            if generated_code(path.span) {
-                return vec![];
-            }
-            error!("Mis-calculated spans for path '{}'. Found {} spans, expected {}. Found spans:",
-                   path_to_string(path),
-                   spans.len(),
-                   segments.len());
-            for s in &spans {
-                let loc = self.sess.codemap().lookup_char_pos(s.lo);
-                error!("    '{}' in {}, line {}",
-                       self.span.snippet(*s),
-                       loc.file.name,
-                       loc.line);
-            }
-            error!("    master span: {:?}: `{}`", path.span, self.span.snippet(path.span));
-            return vec![];
-        }
-
-        let mut result: Vec<(Span, String)> = vec![];
+        let mut result = Vec::with_capacity(segments.len());
 
         let mut segs = vec![];
-        for (i, (seg, span)) in segments.iter().zip(&spans).enumerate() {
+        for (i, seg) in segments.iter().enumerate() {
             segs.push(seg.clone());
             let sub_path = ast::Path {
-                span: *span, // span for the last segment
+                span: seg.span, // span for the last segment
                 segments: segs,
             };
             let qualname = if i == 0 && path.is_global() {
@@ -187,7 +160,7 @@ impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> DumpVisitor<'l, 'tcx, 'll, O> {
             } else {
                 path_to_string(&sub_path)
             };
-            result.push((*span, qualname));
+            result.push((seg.span, qualname));
             segs = sub_path.segments;
         }
 
@@ -345,7 +318,8 @@ impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> DumpVisitor<'l, 'tcx, 'll, O> {
             collector.visit_pat(&arg.pat);
             let span_utils = self.span.clone();
             for &(id, ref p, ..) in &collector.collected_paths {
-                let typ = match self.save_ctxt.tables.node_types.get(&id) {
+                let hir_id = self.tcx.hir.node_to_hir_id(id);
+                let typ = match self.save_ctxt.tables.node_id_to_type_opt(hir_id) {
                     Some(s) => s.to_string(),
                     None => continue,
                 };
@@ -380,23 +354,24 @@ impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> DumpVisitor<'l, 'tcx, 'll, O> {
                       body: Option<&'l ast::Block>,
                       id: ast::NodeId,
                       name: ast::Ident,
+                      generics: &'l ast::Generics,
                       vis: ast::Visibility,
                       span: Span) {
         debug!("process_method: {}:{}", id, name);
 
         if let Some(mut method_data) = self.save_ctxt.get_method_data(id, name.name, span) {
 
-            let sig_str = ::make_signature(&sig.decl, &sig.generics);
+            let sig_str = ::make_signature(&sig.decl, &generics);
             if body.is_some() {
                 self.nest_tables(id, |v| {
                     v.process_formals(&sig.decl.inputs, &method_data.qualname)
                 });
             }
 
-            self.process_generic_params(&sig.generics, span, &method_data.qualname, id);
+            self.process_generic_params(&generics, span, &method_data.qualname, id);
 
             method_data.value = sig_str;
-            method_data.sig = sig::method_signature(id, name, sig, &self.save_ctxt);
+            method_data.sig = sig::method_signature(id, name, generics, sig, &self.save_ctxt);
             self.dumper.dump_def(vis == ast::Visibility::Public, method_data);
         }
 
@@ -436,13 +411,8 @@ impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> DumpVisitor<'l, 'tcx, 'll, O> {
                               full_span: Span,
                               prefix: &str,
                               id: NodeId) {
-        // We can't only use visit_generics since we don't have spans for param
-        // bindings, so we reparse the full_span to get those sub spans.
-        // However full span is the entire enum/fn/struct block, so we only want
-        // the first few to match the number of generics we're looking for.
-        let param_sub_spans = self.span.spans_for_ty_params(full_span,
-                                                            (generics.ty_params.len() as isize));
-        for (param, param_ss) in generics.ty_params.iter().zip(param_sub_spans) {
+        for param in &generics.ty_params {
+            let param_ss = param.span;
             let name = escape(self.span.snippet(param_ss));
             // Append $id to name to make sure each one is unique
             let qualname = format!("{}::{}${}",
@@ -499,12 +469,14 @@ impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> DumpVisitor<'l, 'tcx, 'll, O> {
                                     item: &'l ast::Item,
                                     typ: &'l ast::Ty,
                                     expr: &'l ast::Expr) {
-        if let Some(var_data) = self.save_ctxt.get_item_data(item) {
-            down_cast_data!(var_data, DefData, item.span);
-            self.dumper.dump_def(item.vis == ast::Visibility::Public, var_data);
-        }
-        self.visit_ty(&typ);
-        self.visit_expr(expr);
+        self.nest_tables(item.id, |v| {
+            if let Some(var_data) = v.save_ctxt.get_item_data(item) {
+                down_cast_data!(var_data, DefData, item.span);
+                v.dumper.dump_def(item.vis == ast::Visibility::Public, var_data);
+            }
+            v.visit_ty(&typ);
+            v.visit_expr(expr);
+        });
     }
 
     fn process_assoc_const(&mut self,
@@ -893,7 +865,8 @@ impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> DumpVisitor<'l, 'tcx, 'll, O> {
         match p.node {
             PatKind::Struct(ref _path, ref fields, _) => {
                 // FIXME do something with _path?
-                let adt = match self.save_ctxt.tables.node_id_to_type_opt(p.id) {
+                let hir_id = self.tcx.hir.node_to_hir_id(p.id);
+                let adt = match self.save_ctxt.tables.node_id_to_type_opt(hir_id) {
                     Some(ty) => ty.ty_adt_def().unwrap(),
                     None => {
                         visit::walk_pat(self, p);
@@ -935,7 +908,8 @@ impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> DumpVisitor<'l, 'tcx, 'll, O> {
                 ast::Mutability::Immutable => value.to_string(),
                 _ => String::new(),
             };
-            let typ = match self.save_ctxt.tables.node_types.get(&id) {
+            let hir_id = self.tcx.hir.node_to_hir_id(id);
+            let typ = match self.save_ctxt.tables.node_id_to_type_opt(hir_id) {
                 Some(typ) => {
                     let typ = typ.to_string();
                     if !value.is_empty() {
@@ -1034,6 +1008,7 @@ impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> DumpVisitor<'l, 'tcx, 'll, O> {
                                     body.as_ref().map(|x| &**x),
                                     trait_item.id,
                                     trait_item.ident,
+                                    &trait_item.generics,
                                     ast::Visibility::Public,
                                     trait_item.span);
             }
@@ -1093,6 +1068,7 @@ impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> DumpVisitor<'l, 'tcx, 'll, O> {
                                     Some(body),
                                     impl_item.id,
                                     impl_item.ident,
+                                    &impl_item.generics,
                                     impl_item.vis.clone(),
                                     impl_item.span);
             }
@@ -1378,7 +1354,7 @@ impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> Visitor<'l> for DumpVisitor<'l, 'tc
                                 self.span_from_span(sub_span.expect("No span found for var ref"));
                             self.dumper.dump_ref(Ref {
                                 kind: RefKind::Variable,
-                                span: span,
+                                span,
                                 ref_id: ::id_from_def_id(def.struct_variant().fields[idx.node].did),
                             });
                         }
@@ -1459,15 +1435,18 @@ impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> Visitor<'l> for DumpVisitor<'l, 'tc
         // process collected paths
         for &(id, ref p, immut) in &collector.collected_paths {
             match self.save_ctxt.get_path_def(id) {
-                HirDef::Local(def_id) => {
-                    let id = self.tcx.hir.as_local_node_id(def_id).unwrap();
+                HirDef::Local(id) => {
                     let mut value = if immut == ast::Mutability::Immutable {
                         self.span.snippet(p.span).to_string()
                     } else {
                         "<mutable>".to_string()
                     };
-                    let typ = self.save_ctxt.tables.node_types
-                                  .get(&id).map(|t| t.to_string()).unwrap_or(String::new());
+                    let hir_id = self.tcx.hir.node_to_hir_id(id);
+                    let typ = self.save_ctxt
+                                  .tables
+                                  .node_id_to_type_opt(hir_id)
+                                  .map(|t| t.to_string())
+                                  .unwrap_or(String::new());
                     value.push_str(": ");
                     value.push_str(&typ);
 

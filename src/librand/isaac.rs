@@ -76,7 +76,7 @@ impl IsaacRng {
         rng
     }
 
-    /// Initialises `self`. If `use_rsl` is true, then use the current value
+    /// Initializes `self`. If `use_rsl` is true, then use the current value
     /// of `rsl` as a seed, otherwise construct one algorithmically (not
     /// randomly).
     fn init(&mut self, use_rsl: bool) {
@@ -367,7 +367,7 @@ impl Isaac64Rng {
         rng
     }
 
-    /// Initialises `self`. If `use_rsl` is true, then use the current value
+    /// Initializes `self`. If `use_rsl` is true, then use the current value
     /// of `rsl` as a seed, otherwise construct one algorithmically (not
     /// randomly).
     fn init(&mut self, use_rsl: bool) {
@@ -543,7 +543,8 @@ impl Clone for Isaac64Rng {
 }
 
 impl Rng for Isaac64Rng {
-    // FIXME #7771: having next_u32 like this should be unnecessary
+    // FIXME(https://github.com/rust-lang/rfcs/issues/628)
+    // having next_u32 like this should be unnecessary
     #[inline]
     fn next_u32(&mut self) -> u32 {
         self.next_u64() as u32

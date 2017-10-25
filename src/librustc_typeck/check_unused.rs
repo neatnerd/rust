@@ -14,8 +14,9 @@ use rustc::ty::TyCtxt;
 use syntax::ast;
 use syntax_pos::{Span, DUMMY_SP};
 
-use rustc::hir;
+use rustc::hir::def_id::LOCAL_CRATE;
 use rustc::hir::itemlikevisit::ItemLikeVisitor;
+use rustc::hir;
 use rustc::util::nodemap::DefIdSet;
 
 struct CheckVisitor<'a, 'tcx: 'a> {
@@ -25,7 +26,8 @@ struct CheckVisitor<'a, 'tcx: 'a> {
 
 impl<'a, 'tcx> CheckVisitor<'a, 'tcx> {
     fn check_import(&self, id: ast::NodeId, span: Span) {
-        if !self.tcx.maybe_unused_trait_imports.contains(&id) {
+        let def_id = self.tcx.hir.local_def_id(id);
+        if !self.tcx.maybe_unused_trait_import(def_id) {
             return;
         }
 
@@ -39,7 +41,7 @@ impl<'a, 'tcx> CheckVisitor<'a, 'tcx> {
         } else {
             "unused import".to_string()
         };
-        self.tcx.sess.add_lint(lint::builtin::UNUSED_IMPORTS, id, span, msg);
+        self.tcx.lint_node(lint::builtin::UNUSED_IMPORTS, id, span, &msg);
     }
 }
 
@@ -64,12 +66,30 @@ pub fn check_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
     let mut used_trait_imports = DefIdSet();
     for &body_id in tcx.hir.krate().bodies.keys() {
         let item_def_id = tcx.hir.body_owner_def_id(body_id);
-        let tables = tcx.typeck_tables_of(item_def_id);
-        let imports = &tables.used_trait_imports;
+        let imports = tcx.used_trait_imports(item_def_id);
         debug!("GatherVisitor: item_def_id={:?} with imports {:#?}", item_def_id, imports);
-        used_trait_imports.extend(imports);
+        used_trait_imports.extend(imports.iter());
     }
 
     let mut visitor = CheckVisitor { tcx, used_trait_imports };
     tcx.hir.krate().visit_all_item_likes(&mut visitor);
+
+    for &(def_id, span) in tcx.maybe_unused_extern_crates(LOCAL_CRATE).iter() {
+        let cnum = tcx.extern_mod_stmt_cnum(def_id).unwrap();
+        if tcx.is_compiler_builtins(cnum) {
+            continue
+        }
+        if tcx.is_panic_runtime(cnum) {
+            continue
+        }
+        if tcx.has_global_allocator(cnum) {
+            continue
+        }
+        assert_eq!(def_id.krate, LOCAL_CRATE);
+        let hir_id = tcx.hir.definitions().def_index_to_hir_id(def_id.index);
+        let id = tcx.hir.definitions().find_node_for_hir_id(hir_id);
+        let lint = lint::builtin::UNUSED_EXTERN_CRATES;
+        let msg = "unused extern crate";
+        tcx.lint_node(lint, id, span, msg);
+    }
 }

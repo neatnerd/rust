@@ -11,30 +11,33 @@
 //! This module contains files for saving intermediate work-products.
 
 use persist::fs::*;
-use rustc::dep_graph::{WorkProduct, WorkProductId};
+use rustc::dep_graph::{WorkProduct, WorkProductId, DepGraph, WorkProductFileKind};
 use rustc::session::Session;
-use rustc::session::config::OutputType;
 use rustc::util::fs::link_or_copy;
 use std::path::PathBuf;
 use std::fs as std_fs;
 
 pub fn save_trans_partition(sess: &Session,
+                            dep_graph: &DepGraph,
                             cgu_name: &str,
-                            partition_hash: u64,
-                            files: &[(OutputType, PathBuf)]) {
-    debug!("save_trans_partition({:?},{},{:?})",
+                            files: &[(WorkProductFileKind, PathBuf)]) {
+    debug!("save_trans_partition({:?},{:?})",
            cgu_name,
-           partition_hash,
            files);
     if sess.opts.incremental.is_none() {
-        return;
+        return
     }
     let work_product_id = WorkProductId::from_cgu_name(cgu_name);
 
     let saved_files: Option<Vec<_>> =
         files.iter()
              .map(|&(kind, ref path)| {
-                 let file_name = format!("cgu-{}.{}", cgu_name, kind.extension());
+                 let extension = match kind {
+                     WorkProductFileKind::Object => "o",
+                     WorkProductFileKind::Bytecode => "bc",
+                     WorkProductFileKind::BytecodeCompressed => "bc-compressed",
+                 };
+                 let file_name = format!("cgu-{}.{}", cgu_name, extension);
                  let path_in_incr_dir = in_incr_comp_dir_sess(sess, &file_name);
                  match link_or_copy(path, &path_in_incr_dir) {
                      Ok(_) => Some((kind, file_name)),
@@ -56,11 +59,10 @@ pub fn save_trans_partition(sess: &Session,
 
     let work_product = WorkProduct {
         cgu_name: cgu_name.to_string(),
-        input_hash: partition_hash,
-        saved_files: saved_files,
+        saved_files,
     };
 
-    sess.dep_graph.insert_work_product(&work_product_id, work_product);
+    dep_graph.insert_work_product(&work_product_id, work_product);
 }
 
 pub fn delete_workproduct_files(sess: &Session, work_product: &WorkProduct) {

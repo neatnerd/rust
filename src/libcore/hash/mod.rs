@@ -240,7 +240,12 @@ pub trait Hash {
 /// [`write_u8`]: #method.write_u8
 #[stable(feature = "rust1", since = "1.0.0")]
 pub trait Hasher {
-    /// Completes a round of hashing, producing the output hash generated.
+    /// Returns the hash value for the values written so far.
+    ///
+    /// Despite its name, the method does not reset the hasher’s internal
+    /// state. Additional [`write`]s will continue from the current value.
+    /// If you need to start a fresh hash value, you will have to create
+    /// a new hasher.
     ///
     /// # Examples
     ///
@@ -253,6 +258,8 @@ pub trait Hasher {
     ///
     /// println!("Hash is {:x}!", hasher.finish());
     /// ```
+    ///
+    /// ['write']: #tymethod.write
     #[stable(feature = "rust1", since = "1.0.0")]
     fn finish(&self) -> u64;
 
@@ -349,6 +356,52 @@ pub trait Hasher {
     #[stable(feature = "hasher_write", since = "1.3.0")]
     fn write_isize(&mut self, i: isize) {
         self.write_usize(i as usize)
+    }
+}
+
+#[stable(feature = "indirect_hasher_impl", since = "1.22.0")]
+impl<'a, H: Hasher + ?Sized> Hasher for &'a mut H {
+    fn finish(&self) -> u64 {
+        (**self).finish()
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        (**self).write(bytes)
+    }
+    fn write_u8(&mut self, i: u8) {
+        (**self).write_u8(i)
+    }
+    fn write_u16(&mut self, i: u16) {
+        (**self).write_u16(i)
+    }
+    fn write_u32(&mut self, i: u32) {
+        (**self).write_u32(i)
+    }
+    fn write_u64(&mut self, i: u64) {
+        (**self).write_u64(i)
+    }
+    fn write_u128(&mut self, i: u128) {
+        (**self).write_u128(i)
+    }
+    fn write_usize(&mut self, i: usize) {
+        (**self).write_usize(i)
+    }
+    fn write_i8(&mut self, i: i8) {
+        (**self).write_i8(i)
+    }
+    fn write_i16(&mut self, i: i16) {
+        (**self).write_i16(i)
+    }
+    fn write_i32(&mut self, i: i32) {
+        (**self).write_i32(i)
+    }
+    fn write_i64(&mut self, i: i64) {
+        (**self).write_i64(i)
+    }
+    fn write_i128(&mut self, i: i128) {
+        (**self).write_i128(i)
+    }
+    fn write_isize(&mut self, i: isize) {
+        (**self).write_isize(i)
     }
 }
 

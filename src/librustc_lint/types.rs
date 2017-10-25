@@ -76,7 +76,7 @@ impl LintPass for TypeLimits {
 }
 
 impl<'a, 'tcx> LateLintPass<'a, 'tcx> for TypeLimits {
-    fn check_expr(&mut self, cx: &LateContext, e: &hir::Expr) {
+    fn check_expr(&mut self, cx: &LateContext<'a, 'tcx>, e: &'tcx hir::Expr) {
         match e.node {
             hir::ExprUnary(hir::UnNeg, ref expr) => {
                 // propagate negation, if the negation itself isn't negated
@@ -92,9 +92,9 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for TypeLimits {
                 }
 
                 if binop.node.is_shift() {
-                    let opt_ty_bits = match cx.tables.node_id_to_type(l.id).sty {
-                        ty::TyInt(t) => Some(int_ty_bits(t, cx.sess().target.int_type)),
-                        ty::TyUint(t) => Some(uint_ty_bits(t, cx.sess().target.uint_type)),
+                    let opt_ty_bits = match cx.tables.node_id_to_type(l.hir_id).sty {
+                        ty::TyInt(t) => Some(int_ty_bits(t, cx.sess().target.isize_ty)),
+                        ty::TyUint(t) => Some(uint_ty_bits(t, cx.sess().target.usize_ty)),
                         _ => None,
                     };
 
@@ -117,7 +117,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for TypeLimits {
                                                              cx.param_env.and(substs),
                                                              cx.tables);
                             match const_cx.eval(&r) {
-                                Ok(ConstVal::Integral(i)) => {
+                                Ok(&ty::Const { val: ConstVal::Integral(i), .. }) => {
                                     i.is_negative() ||
                                     i.to_u64()
                                         .map(|i| i >= bits)
@@ -135,13 +135,13 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for TypeLimits {
                 }
             }
             hir::ExprLit(ref lit) => {
-                match cx.tables.node_id_to_type(e.id).sty {
+                match cx.tables.node_id_to_type(e.hir_id).sty {
                     ty::TyInt(t) => {
                         match lit.node {
                             ast::LitKind::Int(v, ast::LitIntType::Signed(_)) |
                             ast::LitKind::Int(v, ast::LitIntType::Unsuffixed) => {
                                 let int_type = if let ast::IntTy::Is = t {
-                                    cx.sess().target.int_type
+                                    cx.sess().target.isize_ty
                                 } else {
                                     t
                                 };
@@ -164,7 +164,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for TypeLimits {
                     }
                     ty::TyUint(t) => {
                         let uint_type = if let ast::UintTy::Us = t {
-                            cx.sess().target.uint_type
+                            cx.sess().target.usize_ty
                         } else {
                             t
                         };
@@ -250,9 +250,9 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for TypeLimits {
             }
         }
 
-        fn int_ty_bits(int_ty: ast::IntTy, target_int_ty: ast::IntTy) -> u64 {
+        fn int_ty_bits(int_ty: ast::IntTy, isize_ty: ast::IntTy) -> u64 {
             match int_ty {
-                ast::IntTy::Is => int_ty_bits(target_int_ty, target_int_ty),
+                ast::IntTy::Is => int_ty_bits(isize_ty, isize_ty),
                 ast::IntTy::I8 => 8,
                 ast::IntTy::I16 => 16 as u64,
                 ast::IntTy::I32 => 32,
@@ -261,9 +261,9 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for TypeLimits {
             }
         }
 
-        fn uint_ty_bits(uint_ty: ast::UintTy, target_uint_ty: ast::UintTy) -> u64 {
+        fn uint_ty_bits(uint_ty: ast::UintTy, usize_ty: ast::UintTy) -> u64 {
             match uint_ty {
-                ast::UintTy::Us => uint_ty_bits(target_uint_ty, target_uint_ty),
+                ast::UintTy::Us => uint_ty_bits(usize_ty, usize_ty),
                 ast::UintTy::U8 => 8,
                 ast::UintTy::U16 => 16,
                 ast::UintTy::U32 => 32,
@@ -285,7 +285,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for TypeLimits {
             // Normalize the binop so that the literal is always on the RHS in
             // the comparison
             let norm_binop = if swap { rev_binop(binop) } else { binop };
-            match cx.tables.node_id_to_type(expr.id).sty {
+            match cx.tables.node_id_to_type(expr.hir_id).sty {
                 ty::TyInt(int_ty) => {
                     let (min, max) = int_ty_range(int_ty);
                     let lit_val: i128 = match lit.node {
@@ -431,7 +431,9 @@ impl<'a, 'tcx> ImproperCTypesVisitor<'a, 'tcx> {
                         // fields are actually safe.
                         let mut all_phantom = true;
                         for field in &def.struct_variant().fields {
-                            let field_ty = cx.normalize_associated_type(&field.ty(cx, substs));
+                            let field_ty = cx.fully_normalize_associated_types_in(
+                                &field.ty(cx, substs)
+                            );
                             let r = self.check_type_for_ffi(cache, field_ty);
                             match r {
                                 FfiSafe => {
@@ -463,7 +465,9 @@ impl<'a, 'tcx> ImproperCTypesVisitor<'a, 'tcx> {
 
                         let mut all_phantom = true;
                         for field in &def.struct_variant().fields {
-                            let field_ty = cx.normalize_associated_type(&field.ty(cx, substs));
+                            let field_ty = cx.fully_normalize_associated_types_in(
+                                &field.ty(cx, substs)
+                            );
                             let r = self.check_type_for_ffi(cache, field_ty);
                             match r {
                                 FfiSafe => {
@@ -516,7 +520,9 @@ impl<'a, 'tcx> ImproperCTypesVisitor<'a, 'tcx> {
                         // Check the contained variants.
                         for variant in &def.variants {
                             for field in &variant.fields {
-                                let arg = cx.normalize_associated_type(&field.ty(cx, substs));
+                                let arg = cx.fully_normalize_associated_types_in(
+                                    &field.ty(cx, substs)
+                                );
                                 let r = self.check_type_for_ffi(cache, arg);
                                 match r {
                                     FfiSafe => {}
@@ -541,6 +547,18 @@ impl<'a, 'tcx> ImproperCTypesVisitor<'a, 'tcx> {
             ty::TyChar => {
                 FfiUnsafe("found Rust type `char` in foreign module, while \
                            `u32` or `libc::wchar_t` should be used")
+            }
+
+            ty::TyInt(ast::IntTy::I128) => {
+                FfiUnsafe("found Rust type `i128` in foreign module, but \
+                           128-bit integers don't currently have a known \
+                           stable ABI")
+            }
+
+            ty::TyUint(ast::UintTy::U128) => {
+                FfiUnsafe("found Rust type `u128` in foreign module, but \
+                           128-bit integers don't currently have a known \
+                           stable ABI")
             }
 
             // Primitive types with a stable representation.
@@ -607,6 +625,7 @@ impl<'a, 'tcx> ImproperCTypesVisitor<'a, 'tcx> {
             ty::TyInfer(..) |
             ty::TyError |
             ty::TyClosure(..) |
+            ty::TyGenerator(..) |
             ty::TyProjection(..) |
             ty::TyAnon(..) |
             ty::TyFnDef(..) => bug!("Unexpected type in foreign function"),
@@ -616,7 +635,7 @@ impl<'a, 'tcx> ImproperCTypesVisitor<'a, 'tcx> {
     fn check_type_for_ffi_and_report_errors(&mut self, sp: Span, ty: Ty<'tcx>) {
         // it is only OK to use this function because extern fns cannot have
         // any generic types right now:
-        let ty = self.cx.tcx.normalize_associated_type(&ty);
+        let ty = self.cx.tcx.fully_normalize_associated_types_in(&ty);
 
         match self.check_type_for_ffi(&mut FxHashSet(), ty) {
             FfiResult::FfiSafe => {}

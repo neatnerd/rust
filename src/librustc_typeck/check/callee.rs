@@ -28,7 +28,7 @@ use rustc::hir;
 /// to `trait_id` (this only cares about the trait, not the specific
 /// method that is called)
 pub fn check_legal_trait_for_method_call(tcx: TyCtxt, span: Span, trait_id: DefId) {
-    if tcx.lang_items.drop_trait() == Some(trait_id) {
+    if tcx.lang_items().drop_trait() == Some(trait_id) {
         struct_span_err!(tcx.sess, span, E0040, "explicit use of destructor method")
             .span_label(span, "explicit destructor calls not allowed")
             .emit();
@@ -38,6 +38,7 @@ pub fn check_legal_trait_for_method_call(tcx: TyCtxt, span: Span, trait_id: DefI
 enum CallStep<'tcx> {
     Builtin(Ty<'tcx>),
     DeferredClosure(ty::FnSig<'tcx>),
+    /// e.g. enum variant constructors
     Overloaded(MethodCallee<'tcx>),
 }
 
@@ -156,9 +157,9 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                                              MethodCallee<'tcx>)> {
         // Try the options that are least restrictive on the caller first.
         for &(opt_trait_def_id, method_name, borrow) in
-            &[(self.tcx.lang_items.fn_trait(), Symbol::intern("call"), true),
-              (self.tcx.lang_items.fn_mut_trait(), Symbol::intern("call_mut"), true),
-              (self.tcx.lang_items.fn_once_trait(), Symbol::intern("call_once"), false)] {
+            &[(self.tcx.lang_items().fn_trait(), Symbol::intern("call"), true),
+              (self.tcx.lang_items().fn_mut_trait(), Symbol::intern("call_mut"), true),
+              (self.tcx.lang_items().fn_once_trait(), Symbol::intern("call_once"), false)] {
             let trait_def_id = match opt_trait_def_id {
                 Some(def_id) => def_id,
                 None => continue,
@@ -222,14 +223,19 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
 
                 if let hir::ExprCall(ref expr, _) = call_expr.node {
                     let def = if let hir::ExprPath(ref qpath) = expr.node {
-                        self.tables.borrow().qpath_def(qpath, expr.id)
+                        self.tables.borrow().qpath_def(qpath, expr.hir_id)
                     } else {
                         Def::Err
                     };
-                    if def != Def::Err {
-                        if let Some(span) = self.tcx.hir.span_if_local(def.def_id()) {
-                            err.span_note(span, "defined here");
+                    let def_span = match def {
+                        Def::Err => None,
+                        Def::Local(id) | Def::Upvar(id, ..) => {
+                            Some(self.tcx.hir.span(id))
                         }
+                        _ => self.tcx.hir.span_if_local(def.def_id())
+                    };
+                    if let Some(span) = def_span {
+                        err.span_note(span, "defined here");
                     }
                 }
 
@@ -265,6 +271,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                                             fn_sig.output(),
                                             fn_sig.inputs());
         self.check_argument_types(call_expr.span,
+                                  call_expr.span,
                                   fn_sig.inputs(),
                                   &expected_arg_tys[..],
                                   arg_exprs,
@@ -292,6 +299,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                                                                fn_sig.inputs());
 
         self.check_argument_types(call_expr.span,
+                                  call_expr.span,
                                   fn_sig.inputs(),
                                   &expected_arg_tys,
                                   arg_exprs,
@@ -309,12 +317,13 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                                method_callee: MethodCallee<'tcx>)
                                -> Ty<'tcx> {
         let output_type = self.check_method_argument_types(call_expr.span,
+                                                           call_expr.span,
                                                            Ok(method_callee),
                                                            arg_exprs,
                                                            TupleArgumentsFlag::TupleArguments,
                                                            expected);
 
-        self.write_method_call(call_expr.id, method_callee);
+        self.write_method_call(call_expr.hir_id, method_callee);
         output_type
     }
 }
@@ -364,7 +373,8 @@ impl<'a, 'gcx, 'tcx> DeferredCallResolution<'gcx, 'tcx> {
                 adjustments.extend(autoref);
                 fcx.apply_adjustments(self.callee_expr, adjustments);
 
-                fcx.write_method_call(self.call_expr.id, method_callee);
+                fcx.write_method_call(self.call_expr.hir_id,
+                                      method_callee);
             }
             None => {
                 span_bug!(self.call_expr.span,

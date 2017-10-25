@@ -234,7 +234,7 @@ impl<K, Q: ?Sized> super::Recover<Q> for BTreeMap<K, ()>
         match search::search_tree(self.root.as_mut(), key) {
             Found(handle) => {
                 Some(OccupiedEntry {
-                         handle: handle,
+                         handle,
                          length: &mut self.length,
                          _marker: PhantomData,
                      }
@@ -250,8 +250,8 @@ impl<K, Q: ?Sized> super::Recover<Q> for BTreeMap<K, ()>
             Found(handle) => Some(mem::replace(handle.into_kv_mut().0, key)),
             GoDown(handle) => {
                 VacantEntry {
-                    key: key,
-                    handle: handle,
+                    key,
+                    handle,
                     length: &mut self.length,
                     _marker: PhantomData,
                 }
@@ -695,7 +695,7 @@ impl<K: Ord, V> BTreeMap<K, V> {
         match search::search_tree(self.root.as_mut(), key) {
             Found(handle) => {
                 Some(OccupiedEntry {
-                         handle: handle,
+                         handle,
                          length: &mut self.length,
                          _marker: PhantomData,
                      }
@@ -866,15 +866,15 @@ impl<K: Ord, V> BTreeMap<K, V> {
         match search::search_tree(self.root.as_mut(), &key) {
             Found(handle) => {
                 Occupied(OccupiedEntry {
-                    handle: handle,
+                    handle,
                     length: &mut self.length,
                     _marker: PhantomData,
                 })
             }
             GoDown(handle) => {
                 Vacant(VacantEntry {
-                    key: key,
-                    handle: handle,
+                    key,
+                    handle,
                     length: &mut self.length,
                     _marker: PhantomData,
                 })
@@ -2102,6 +2102,67 @@ impl<'a, K: Ord, V> Entry<'a, K, V> {
             Vacant(ref entry) => entry.key(),
         }
     }
+
+    /// Provides in-place mutable access to an occupied entry before any
+    /// potential inserts into the map.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(entry_and_modify)]
+    /// use std::collections::BTreeMap;
+    ///
+    /// let mut map: BTreeMap<&str, usize> = BTreeMap::new();
+    ///
+    /// map.entry("poneyland")
+    ///    .and_modify(|e| { *e += 1 })
+    ///    .or_insert(42);
+    /// assert_eq!(map["poneyland"], 42);
+    ///
+    /// map.entry("poneyland")
+    ///    .and_modify(|e| { *e += 1 })
+    ///    .or_insert(42);
+    /// assert_eq!(map["poneyland"], 43);
+    /// ```
+    #[unstable(feature = "entry_and_modify", issue = "44733")]
+    pub fn and_modify<F>(self, mut f: F) -> Self
+        where F: FnMut(&mut V)
+    {
+        match self {
+            Occupied(mut entry) => {
+                f(entry.get_mut());
+                Occupied(entry)
+            },
+            Vacant(entry) => Vacant(entry),
+        }
+    }
+}
+
+impl<'a, K: Ord, V: Default> Entry<'a, K, V> {
+    #[unstable(feature = "entry_or_default", issue = "44324")]
+    /// Ensures a value is in the entry by inserting the default value if empty,
+    /// and returns a mutable reference to the value in the entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(entry_or_default)]
+    /// # fn main() {
+    /// use std::collections::BTreeMap;
+    ///
+    /// let mut map: BTreeMap<&str, Option<usize>> = BTreeMap::new();
+    /// map.entry("poneyland").or_default();
+    ///
+    /// assert_eq!(map["poneyland"], None);
+    /// # }
+    /// ```
+    pub fn or_default(self) -> &'a mut V {
+        match self {
+            Occupied(entry) => entry.into_mut(),
+            Vacant(entry) => entry.insert(Default::default()),
+        }
+    }
+
 }
 
 impl<'a, K: Ord, V> VacantEntry<'a, K, V> {

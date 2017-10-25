@@ -16,16 +16,13 @@
 //!
 //! [arc]: struct.Arc.html
 
-use boxed::Box;
-
 use core::sync::atomic;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release, SeqCst};
 use core::borrow;
 use core::fmt;
 use core::cmp::Ordering;
 use core::intrinsics::abort;
-use core::mem;
-use core::mem::uninitialized;
+use core::mem::{self, align_of_val, size_of_val, uninitialized};
 use core::ops::Deref;
 use core::ops::CoerceUnsized;
 use core::ptr::{self, Shared};
@@ -34,7 +31,10 @@ use core::hash::{Hash, Hasher};
 use core::{isize, usize};
 use core::convert::From;
 
-use heap::{Heap, Alloc, Layout};
+use heap::{Heap, Alloc, Layout, box_free};
+use boxed::Box;
+use string::String;
+use vec::Vec;
 
 /// A soft limit on the amount of references that may be made to an `Arc`.
 ///
@@ -52,8 +52,10 @@ const MAX_REFCOUNT: usize = (isize::MAX) as usize;
 /// also destroyed.
 ///
 /// Shared references in Rust disallow mutation by default, and `Arc` is no
-/// exception. If you need to mutate through an `Arc`, use [`Mutex`][mutex],
-/// [`RwLock`][rwlock], or one of the [`Atomic`][atomic] types.
+/// exception: you cannot generally obtain a mutable reference to something
+/// inside an `Arc`. If you need to mutate through an `Arc`, use
+/// [`Mutex`][mutex], [`RwLock`][rwlock], or one of the [`Atomic`][atomic]
+/// types.
 ///
 /// ## Thread Safety
 ///
@@ -72,13 +74,13 @@ const MAX_REFCOUNT: usize = (isize::MAX) as usize;
 /// first: after all, isn't the point of `Arc<T>` thread safety? The key is
 /// this: `Arc<T>` makes it thread safe to have multiple ownership of the same
 /// data, but it  doesn't add thread safety to its data. Consider
-/// `Arc<RefCell<T>>`. `RefCell<T>` isn't [`Sync`], and if `Arc<T>` was always
-/// [`Send`], `Arc<RefCell<T>>` would be as well. But then we'd have a problem:
-/// `RefCell<T>` is not thread safe; it keeps track of the borrowing count using
+/// `Arc<`[`RefCell<T>`]`>`. [`RefCell<T>`] isn't [`Sync`], and if `Arc<T>` was always
+/// [`Send`], `Arc<`[`RefCell<T>`]`>` would be as well. But then we'd have a problem:
+/// [`RefCell<T>`] is not thread safe; it keeps track of the borrowing count using
 /// non-atomic operations.
 ///
 /// In the end, this means that you may need to pair `Arc<T>` with some sort of
-/// `std::sync` type, usually `Mutex<T>`.
+/// [`std::sync`] type, usually [`Mutex<T>`][mutex].
 ///
 /// ## Breaking cycles with `Weak`
 ///
@@ -95,7 +97,7 @@ const MAX_REFCOUNT: usize = (isize::MAX) as usize;
 /// # Cloning references
 ///
 /// Creating a new reference from an existing reference counted pointer is done using the
-/// `Clone` trait implemented for [`Arc<T>`][`arc`] and [`Weak<T>`][`weak`].
+/// `Clone` trait implemented for [`Arc<T>`][arc] and [`Weak<T>`][weak].
 ///
 /// ```
 /// use std::sync::Arc;
@@ -106,7 +108,7 @@ const MAX_REFCOUNT: usize = (isize::MAX) as usize;
 /// // a and b both point to the same memory location as foo.
 /// ```
 ///
-/// The `Arc::clone(&from)` syntax is the most idiomatic because it conveys more explicitly
+/// The [`Arc::clone(&from)`] syntax is the most idiomatic because it conveys more explicitly
 /// the meaning of the code. In the example above, this syntax makes it easier to see that
 /// this code is creating a new reference rather than copying the whole content of foo.
 ///
@@ -141,6 +143,9 @@ const MAX_REFCOUNT: usize = (isize::MAX) as usize;
 /// [upgrade]: struct.Weak.html#method.upgrade
 /// [`None`]: ../../std/option/enum.Option.html#variant.None
 /// [assoc]: ../../book/first-edition/method-syntax.html#associated-functions
+/// [`RefCell<T>`]: ../../std/cell/struct.RefCell.html
+/// [`std::sync`]: ../../std/sync/index.html
+/// [`Arc::clone(&from)`]: #method.clone
 ///
 /// # Examples
 ///
@@ -278,7 +283,7 @@ impl<T> Arc<T> {
         let x: Box<_> = box ArcInner {
             strong: atomic::AtomicUsize::new(1),
             weak: atomic::AtomicUsize::new(1),
-            data: data,
+            data,
         };
         Arc { ptr: Shared::from(Box::into_unique(x)) }
     }
@@ -324,7 +329,9 @@ impl<T> Arc<T> {
             Ok(elem)
         }
     }
+}
 
+impl<T: ?Sized> Arc<T> {
     /// Consumes the `Arc`, returning the wrapped pointer.
     ///
     /// To avoid a memory leak the pointer must be converted back to an `Arc` using
@@ -378,16 +385,21 @@ impl<T> Arc<T> {
     /// ```
     #[stable(feature = "rc_raw", since = "1.17.0")]
     pub unsafe fn from_raw(ptr: *const T) -> Self {
-        // To find the corresponding pointer to the `ArcInner` we need to subtract the offset of the
-        // `data` field from the pointer.
-        let ptr = (ptr as *const u8).offset(-offset_of!(ArcInner<T>, data));
+        // Align the unsized value to the end of the ArcInner.
+        // Because it is ?Sized, it will always be the last field in memory.
+        let align = align_of_val(&*ptr);
+        let layout = Layout::new::<ArcInner<()>>();
+        let offset = (layout.size() + layout.padding_needed_for(align)) as isize;
+
+        // Reverse the offset to find the original ArcInner.
+        let fake_ptr = ptr as *mut ArcInner<T>;
+        let arc_ptr = set_data_ptr(fake_ptr, (ptr as *mut u8).offset(-offset));
+
         Arc {
-            ptr: Shared::new_unchecked(ptr as *mut u8 as *mut _),
+            ptr: Shared::new_unchecked(arc_ptr),
         }
     }
-}
 
-impl<T: ?Sized> Arc<T> {
     /// Creates a new [`Weak`][weak] pointer to this value.
     ///
     /// [weak]: struct.Weak.html
@@ -529,6 +541,141 @@ impl<T: ?Sized> Arc<T> {
     /// ```
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
         this.ptr.as_ptr() == other.ptr.as_ptr()
+    }
+}
+
+impl<T: ?Sized> Arc<T> {
+    // Allocates an `ArcInner<T>` with sufficient space for an unsized value
+    unsafe fn allocate_for_ptr(ptr: *const T) -> *mut ArcInner<T> {
+        // Create a fake ArcInner to find allocation size and alignment
+        let fake_ptr = ptr as *mut ArcInner<T>;
+
+        let layout = Layout::for_value(&*fake_ptr);
+
+        let mem = Heap.alloc(layout)
+            .unwrap_or_else(|e| Heap.oom(e));
+
+        // Initialize the real ArcInner
+        let inner = set_data_ptr(ptr as *mut T, mem) as *mut ArcInner<T>;
+
+        ptr::write(&mut (*inner).strong, atomic::AtomicUsize::new(1));
+        ptr::write(&mut (*inner).weak, atomic::AtomicUsize::new(1));
+
+        inner
+    }
+
+    fn from_box(v: Box<T>) -> Arc<T> {
+        unsafe {
+            let bptr = Box::into_raw(v);
+
+            let value_size = size_of_val(&*bptr);
+            let ptr = Self::allocate_for_ptr(bptr);
+
+            // Copy value as bytes
+            ptr::copy_nonoverlapping(
+                bptr as *const T as *const u8,
+                &mut (*ptr).data as *mut _ as *mut u8,
+                value_size);
+
+            // Free the allocation without dropping its contents
+            box_free(bptr);
+
+            Arc { ptr: Shared::new_unchecked(ptr) }
+        }
+    }
+}
+
+// Sets the data pointer of a `?Sized` raw pointer.
+//
+// For a slice/trait object, this sets the `data` field and leaves the rest
+// unchanged. For a sized raw pointer, this simply sets the pointer.
+unsafe fn set_data_ptr<T: ?Sized, U>(mut ptr: *mut T, data: *mut U) -> *mut T {
+    ptr::write(&mut ptr as *mut _ as *mut *mut u8, data as *mut u8);
+    ptr
+}
+
+impl<T> Arc<[T]> {
+    // Copy elements from slice into newly allocated Arc<[T]>
+    //
+    // Unsafe because the caller must either take ownership or bind `T: Copy`
+    unsafe fn copy_from_slice(v: &[T]) -> Arc<[T]> {
+        let v_ptr = v as *const [T];
+        let ptr = Self::allocate_for_ptr(v_ptr);
+
+        ptr::copy_nonoverlapping(
+            v.as_ptr(),
+            &mut (*ptr).data as *mut [T] as *mut T,
+            v.len());
+
+        Arc { ptr: Shared::new_unchecked(ptr) }
+    }
+}
+
+// Specialization trait used for From<&[T]>
+trait ArcFromSlice<T> {
+    fn from_slice(slice: &[T]) -> Self;
+}
+
+impl<T: Clone> ArcFromSlice<T> for Arc<[T]> {
+    #[inline]
+    default fn from_slice(v: &[T]) -> Self {
+        // Panic guard while cloning T elements.
+        // In the event of a panic, elements that have been written
+        // into the new ArcInner will be dropped, then the memory freed.
+        struct Guard<T> {
+            mem: *mut u8,
+            elems: *mut T,
+            layout: Layout,
+            n_elems: usize,
+        }
+
+        impl<T> Drop for Guard<T> {
+            fn drop(&mut self) {
+                use core::slice::from_raw_parts_mut;
+
+                unsafe {
+                    let slice = from_raw_parts_mut(self.elems, self.n_elems);
+                    ptr::drop_in_place(slice);
+
+                    Heap.dealloc(self.mem, self.layout.clone());
+                }
+            }
+        }
+
+        unsafe {
+            let v_ptr = v as *const [T];
+            let ptr = Self::allocate_for_ptr(v_ptr);
+
+            let mem = ptr as *mut _ as *mut u8;
+            let layout = Layout::for_value(&*ptr);
+
+            // Pointer to first element
+            let elems = &mut (*ptr).data as *mut [T] as *mut T;
+
+            let mut guard = Guard{
+                mem: mem,
+                elems: elems,
+                layout: layout,
+                n_elems: 0,
+            };
+
+            for (i, item) in v.iter().enumerate() {
+                ptr::write(elems.offset(i as isize), item.clone());
+                guard.n_elems += 1;
+            }
+
+            // All clear. Forget the guard so it doesn't free the new ArcInner.
+            mem::forget(guard);
+
+            Arc { ptr: Shared::new_unchecked(ptr) }
+        }
+    }
+}
+
+impl<T: Copy> ArcFromSlice<T> for Arc<[T]> {
+    #[inline]
+    fn from_slice(v: &[T]) -> Self {
+        unsafe { Arc::copy_from_slice(v) }
     }
 }
 
@@ -1216,8 +1363,56 @@ impl<T> From<T> for Arc<T> {
     }
 }
 
+#[stable(feature = "shared_from_slice", since = "1.21.0")]
+impl<'a, T: Clone> From<&'a [T]> for Arc<[T]> {
+    #[inline]
+    fn from(v: &[T]) -> Arc<[T]> {
+        <Self as ArcFromSlice<T>>::from_slice(v)
+    }
+}
+
+#[stable(feature = "shared_from_slice", since = "1.21.0")]
+impl<'a> From<&'a str> for Arc<str> {
+    #[inline]
+    fn from(v: &str) -> Arc<str> {
+        unsafe { mem::transmute(<Arc<[u8]>>::from(v.as_bytes())) }
+    }
+}
+
+#[stable(feature = "shared_from_slice", since = "1.21.0")]
+impl From<String> for Arc<str> {
+    #[inline]
+    fn from(v: String) -> Arc<str> {
+        Arc::from(&v[..])
+    }
+}
+
+#[stable(feature = "shared_from_slice", since = "1.21.0")]
+impl<T: ?Sized> From<Box<T>> for Arc<T> {
+    #[inline]
+    fn from(v: Box<T>) -> Arc<T> {
+        Arc::from_box(v)
+    }
+}
+
+#[stable(feature = "shared_from_slice", since = "1.21.0")]
+impl<T> From<Vec<T>> for Arc<[T]> {
+    #[inline]
+    fn from(mut v: Vec<T>) -> Arc<[T]> {
+        unsafe {
+            let arc = Arc::copy_from_slice(&v);
+
+            // Allow the Vec to free its memory, but not destroy its contents
+            v.set_len(0);
+
+            arc
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::boxed::Box;
     use std::clone::Clone;
     use std::sync::mpsc::channel;
     use std::mem::drop;
@@ -1306,6 +1501,28 @@ mod tests {
 
             assert_eq!(Arc::try_unwrap(x).map(|x| *x), Ok("hello"));
         }
+    }
+
+    #[test]
+    fn test_into_from_raw_unsized() {
+        use std::fmt::Display;
+        use std::string::ToString;
+
+        let arc: Arc<str> = Arc::from("foo");
+
+        let ptr = Arc::into_raw(arc.clone());
+        let arc2 = unsafe { Arc::from_raw(ptr) };
+
+        assert_eq!(unsafe { &*ptr }, "foo");
+        assert_eq!(arc, arc2);
+
+        let arc: Arc<Display> = Arc::new(123);
+
+        let ptr = Arc::into_raw(arc.clone());
+        let arc2 = unsafe { Arc::from_raw(ptr) };
+
+        assert_eq!(unsafe { &*ptr }.to_string(), "123");
+        assert_eq!(arc2.to_string(), "123");
     }
 
     #[test]
@@ -1519,6 +1736,113 @@ mod tests {
             assert!(n < 2, "bad weak count: {}", n);
         }
         t.join().unwrap();
+    }
+
+    #[test]
+    fn test_from_str() {
+        let r: Arc<str> = Arc::from("foo");
+
+        assert_eq!(&r[..], "foo");
+    }
+
+    #[test]
+    fn test_copy_from_slice() {
+        let s: &[u32] = &[1, 2, 3];
+        let r: Arc<[u32]> = Arc::from(s);
+
+        assert_eq!(&r[..], [1, 2, 3]);
+    }
+
+    #[test]
+    fn test_clone_from_slice() {
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct X(u32);
+
+        let s: &[X] = &[X(1), X(2), X(3)];
+        let r: Arc<[X]> = Arc::from(s);
+
+        assert_eq!(&r[..], s);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_clone_from_slice_panic() {
+        use std::string::{String, ToString};
+
+        struct Fail(u32, String);
+
+        impl Clone for Fail {
+            fn clone(&self) -> Fail {
+                if self.0 == 2 {
+                    panic!();
+                }
+                Fail(self.0, self.1.clone())
+            }
+        }
+
+        let s: &[Fail] = &[
+            Fail(0, "foo".to_string()),
+            Fail(1, "bar".to_string()),
+            Fail(2, "baz".to_string()),
+        ];
+
+        // Should panic, but not cause memory corruption
+        let _r: Arc<[Fail]> = Arc::from(s);
+    }
+
+    #[test]
+    fn test_from_box() {
+        let b: Box<u32> = box 123;
+        let r: Arc<u32> = Arc::from(b);
+
+        assert_eq!(*r, 123);
+    }
+
+    #[test]
+    fn test_from_box_str() {
+        use std::string::String;
+
+        let s = String::from("foo").into_boxed_str();
+        let r: Arc<str> = Arc::from(s);
+
+        assert_eq!(&r[..], "foo");
+    }
+
+    #[test]
+    fn test_from_box_slice() {
+        let s = vec![1, 2, 3].into_boxed_slice();
+        let r: Arc<[u32]> = Arc::from(s);
+
+        assert_eq!(&r[..], [1, 2, 3]);
+    }
+
+    #[test]
+    fn test_from_box_trait() {
+        use std::fmt::Display;
+        use std::string::ToString;
+
+        let b: Box<Display> = box 123;
+        let r: Arc<Display> = Arc::from(b);
+
+        assert_eq!(r.to_string(), "123");
+    }
+
+    #[test]
+    fn test_from_box_trait_zero_sized() {
+        use std::fmt::Debug;
+
+        let b: Box<Debug> = box ();
+        let r: Arc<Debug> = Arc::from(b);
+
+        assert_eq!(format!("{:?}", r), "()");
+    }
+
+    #[test]
+    fn test_from_vec() {
+        let v = vec![1, 2, 3];
+        let r: Arc<[u32]> = Arc::from(v);
+
+        assert_eq!(&r[..], [1, 2, 3]);
     }
 }
 

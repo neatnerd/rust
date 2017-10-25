@@ -17,6 +17,7 @@ use rustc::ty::{self, Ty, TyCtxt, ToPolyTraitRef, ToPredicate, TypeFoldable};
 use hir::def::Def;
 use hir::def_id::{CRATE_DEF_INDEX, DefId};
 use middle::lang_items::FnOnceTraitLangItem;
+use namespace::Namespace;
 use rustc::traits::{Obligation, SelectionContext};
 use util::nodemap::FxHashSet;
 
@@ -45,7 +46,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
             ty::TyFnPtr(_) => true,
             // If it's not a simple function, look for things which implement FnOnce
             _ => {
-                let fn_once = match tcx.lang_items.require(FnOnceTraitLangItem) {
+                let fn_once = match tcx.lang_items().require(FnOnceTraitLangItem) {
                     Ok(fn_once) => fn_once,
                     Err(..) => return false,
                 };
@@ -92,12 +93,12 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                     CandidateSource::ImplSource(impl_did) => {
                         // Provide the best span we can. Use the item, if local to crate, else
                         // the impl, if local to crate (item may be defaulted), else nothing.
-                        let item = self.associated_item(impl_did, item_name)
+                        let item = self.associated_item(impl_did, item_name, Namespace::Value)
                             .or_else(|| {
                                 self.associated_item(
                                     self.tcx.impl_trait_ref(impl_did).unwrap().def_id,
-
-                                    item_name
+                                    item_name,
+                                    Namespace::Value,
                                 )
                             }).unwrap();
                         let note_span = self.tcx.hir.span_if_local(item.def_id).or_else(|| {
@@ -127,7 +128,9 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                         }
                     }
                     CandidateSource::TraitSource(trait_did) => {
-                        let item = self.associated_item(trait_did, item_name).unwrap();
+                        let item = self
+                            .associated_item(trait_did, item_name, Namespace::Value)
+                            .unwrap();
                         let item_span = self.tcx.def_span(item.def_id);
                         span_note!(err,
                                    item_span,
@@ -164,6 +167,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
             MethodError::NoMatch(NoMatchData { static_candidates: static_sources,
                                                unsatisfied_predicates,
                                                out_of_scope_traits,
+                                               lev_candidate,
                                                mode,
                                                .. }) => {
                 let tcx = self.tcx;
@@ -260,6 +264,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 if !static_sources.is_empty() {
                     err.note("found the following associated functions; to be used as methods, \
                               functions must have a `self` parameter");
+                    err.help(&format!("try with `{}::{}`", self.ty_to_string(actual), item_name));
 
                     report_candidates(&mut err, static_sources);
                 }
@@ -281,6 +286,10 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                                               item_name,
                                               rcvr_expr,
                                               out_of_scope_traits);
+
+                if let Some(lev_candidate) = lev_candidate {
+                    err.help(&format!("did you mean `{}`?", lev_candidate.name));
+                }
                 err.emit();
             }
 
@@ -295,26 +304,79 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 err.emit();
             }
 
-            MethodError::ClosureAmbiguity(trait_def_id) => {
-                let msg = format!("the `{}` method from the `{}` trait cannot be explicitly \
-                                   invoked on this closure as we have not yet inferred what \
-                                   kind of closure it is",
-                                  item_name,
-                                  self.tcx.item_path_str(trait_def_id));
-                let msg = if let Some(callee) = rcvr_expr {
-                    format!("{}; use overloaded call notation instead (e.g., `{}()`)",
-                            msg,
-                            self.tcx.hir.node_to_pretty_string(callee.id))
-                } else {
-                    msg
-                };
-                self.sess().span_err(span, &msg);
+            MethodError::PrivateMatch(def, out_of_scope_traits) => {
+                let mut err = struct_span_err!(self.tcx.sess, span, E0624,
+                                               "{} `{}` is private", def.kind_name(), item_name);
+                self.suggest_valid_traits(&mut err, out_of_scope_traits);
+                err.emit();
             }
 
-            MethodError::PrivateMatch(def) => {
-                let msg = format!("{} `{}` is private", def.kind_name(), item_name);
-                self.tcx.sess.span_err(span, &msg);
+            MethodError::IllegalSizedBound(candidates) => {
+                let msg = format!("the `{}` method cannot be invoked on a trait object", item_name);
+                let mut err = self.sess().struct_span_err(span, &msg);
+                if !candidates.is_empty() {
+                    let help = format!("{an}other candidate{s} {were} found in the following \
+                                        trait{s}, perhaps add a `use` for {one_of_them}:",
+                                    an = if candidates.len() == 1 {"an" } else { "" },
+                                    s = if candidates.len() == 1 { "" } else { "s" },
+                                    were = if candidates.len() == 1 { "was" } else { "were" },
+                                    one_of_them = if candidates.len() == 1 {
+                                        "it"
+                                    } else {
+                                        "one_of_them"
+                                    });
+                    self.suggest_use_candidates(&mut err, help, candidates);
+                }
+                err.emit();
             }
+
+            MethodError::BadReturnType => {
+                bug!("no return type expectations but got BadReturnType")
+            }
+        }
+    }
+
+    fn suggest_use_candidates(&self,
+                              err: &mut DiagnosticBuilder,
+                              mut msg: String,
+                              candidates: Vec<DefId>) {
+        let limit = if candidates.len() == 5 { 5 } else { 4 };
+        for (i, trait_did) in candidates.iter().take(limit).enumerate() {
+            msg.push_str(&format!("\ncandidate #{}: `use {};`",
+                                    i + 1,
+                                    self.tcx.item_path_str(*trait_did)));
+        }
+        if candidates.len() > limit {
+            msg.push_str(&format!("\nand {} others", candidates.len() - limit));
+        }
+        err.note(&msg[..]);
+    }
+
+    fn suggest_valid_traits(&self,
+                            err: &mut DiagnosticBuilder,
+                            valid_out_of_scope_traits: Vec<DefId>) -> bool {
+        if !valid_out_of_scope_traits.is_empty() {
+            let mut candidates = valid_out_of_scope_traits;
+            candidates.sort();
+            candidates.dedup();
+            err.help("items from traits can only be used if the trait is in scope");
+            let msg = format!("the following {traits_are} implemented but not in scope, \
+                               perhaps add a `use` for {one_of_them}:",
+                            traits_are = if candidates.len() == 1 {
+                                "trait is"
+                            } else {
+                                "traits are"
+                            },
+                            one_of_them = if candidates.len() == 1 {
+                                "it"
+                            } else {
+                                "one of them"
+                            });
+
+            self.suggest_use_candidates(err, msg, candidates);
+            true
+        } else {
+            false
         }
     }
 
@@ -325,35 +387,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                                 item_name: ast::Name,
                                 rcvr_expr: Option<&hir::Expr>,
                                 valid_out_of_scope_traits: Vec<DefId>) {
-        if !valid_out_of_scope_traits.is_empty() {
-            let mut candidates = valid_out_of_scope_traits;
-            candidates.sort();
-            candidates.dedup();
-            err.help("items from traits can only be used if the trait is in scope");
-            let mut msg = format!("the following {traits_are} implemented but not in scope, \
-                                   perhaps add a `use` for {one_of_them}:",
-                              traits_are = if candidates.len() == 1 {
-                                  "trait is"
-                              } else {
-                                  "traits are"
-                              },
-                              one_of_them = if candidates.len() == 1 {
-                                  "it"
-                              } else {
-                                  "one of them"
-                              });
-
-            let limit = if candidates.len() == 5 { 5 } else { 4 };
-            for (i, trait_did) in candidates.iter().take(limit).enumerate() {
-                msg.push_str(&format!("\ncandidate #{}: `use {};`",
-                                      i + 1,
-                                      self.tcx.item_path_str(*trait_did)));
-            }
-            if candidates.len() > limit {
-                msg.push_str(&format!("\nand {} others", candidates.len() - limit));
-            }
-            err.note(&msg[..]);
-
+        if self.suggest_valid_traits(err, valid_out_of_scope_traits) {
             return;
         }
 
@@ -371,7 +405,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 // implementing a trait would be legal but is rejected
                 // here).
                 (type_is_local || info.def_id.is_local())
-                    && self.associated_item(info.def_id, item_name).is_some()
+                    && self.associated_item(info.def_id, item_name, Namespace::Value).is_some()
             })
             .collect::<Vec<_>>();
 
@@ -526,14 +560,14 @@ pub fn all_traits<'a, 'gcx, 'tcx>(tcx: TyCtxt<'a, 'gcx, 'tcx>) -> AllTraits<'a> 
                     if !external_mods.insert(def_id) {
                         return;
                     }
-                    for child in tcx.sess.cstore.item_children(def_id, tcx.sess) {
+                    for child in tcx.item_children(def_id).iter() {
                         handle_external_def(tcx, traits, external_mods, child.def)
                     }
                 }
                 _ => {}
             }
         }
-        for cnum in tcx.sess.cstore.crates() {
+        for &cnum in tcx.crates().iter() {
             let def_id = DefId {
                 krate: cnum,
                 index: CRATE_DEF_INDEX,
@@ -547,7 +581,7 @@ pub fn all_traits<'a, 'gcx, 'tcx>(tcx: TyCtxt<'a, 'gcx, 'tcx>) -> AllTraits<'a> 
     let borrow = tcx.all_traits.borrow();
     assert!(borrow.is_some());
     AllTraits {
-        borrow: borrow,
+        borrow,
         idx: 0,
     }
 }

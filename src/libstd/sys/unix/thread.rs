@@ -20,6 +20,11 @@ use time::Duration;
 
 use sys_common::thread::*;
 
+#[cfg(not(target_os = "l4re"))]
+pub const DEFAULT_MIN_STACK_SIZE: usize = 2 * 1024 * 1024;
+#[cfg(target_os = "l4re")]
+pub const DEFAULT_MIN_STACK_SIZE: usize = 1024 * 1024;
+
 pub struct Thread {
     id: libc::pthread_t,
 }
@@ -52,6 +57,7 @@ impl Thread {
         assert_eq!(libc::pthread_attr_init(&mut attr), 0);
 
         let stack_size = cmp::max(stack, min_stack_size(&attr));
+
         match pthread_attr_setstacksize(&mut attr,
                                         stack_size) {
             0 => {}
@@ -131,6 +137,7 @@ impl Thread {
     #[cfg(any(target_env = "newlib",
               target_os = "solaris",
               target_os = "haiku",
+              target_os = "l4re",
               target_os = "emscripten"))]
     pub fn set_name(_name: &CStr) {
         // Newlib, Illumos, Haiku, and Emscripten have no way to set a thread name.
@@ -142,7 +149,7 @@ impl Thread {
 
     pub fn sleep(dur: Duration) {
         let mut secs = dur.as_secs();
-        let mut nsecs = dur.subsec_nanos() as libc::c_long;
+        let mut nsecs = dur.subsec_nanos() as _;
 
         // If we're awoken with a signal then the return value will be -1 and
         // nanosleep will fill in `ts` with the remaining time.
@@ -168,7 +175,8 @@ impl Thread {
         unsafe {
             let ret = libc::pthread_join(self.id, ptr::null_mut());
             mem::forget(self);
-            debug_assert_eq!(ret, 0);
+            assert!(ret == 0,
+                    "failed to join thread: {}", io::Error::from_raw_os_error(ret));
         }
     }
 
@@ -225,7 +233,7 @@ pub mod guard {
     }
 
     #[cfg(any(target_os = "android", target_os = "freebsd",
-              target_os = "linux", target_os = "netbsd"))]
+              target_os = "linux", target_os = "netbsd", target_os = "l4re"))]
     unsafe fn get_stack_start() -> Option<*mut libc::c_void> {
         let mut ret = None;
         let mut attr: libc::pthread_attr_t = ::mem::zeroed();
@@ -327,7 +335,7 @@ pub mod guard {
     }
 
     #[cfg(any(target_os = "android", target_os = "freebsd",
-              target_os = "linux", target_os = "netbsd"))]
+              target_os = "linux", target_os = "netbsd", target_os = "l4re"))]
     pub unsafe fn current() -> Option<usize> {
         let mut ret = None;
         let mut attr: libc::pthread_attr_t = ::mem::zeroed();

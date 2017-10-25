@@ -459,9 +459,11 @@ impl<T> VecDeque<T> {
     ///
     /// `i` and `j` may be equal.
     ///
-    /// Fails if there is no element with either index.
-    ///
     /// Element at index 0 is the front of the queue.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either index is out of bounds.
     ///
     /// # Examples
     ///
@@ -556,7 +558,7 @@ impl<T> VecDeque<T> {
             .and_then(|needed_cap| needed_cap.checked_next_power_of_two())
             .expect("capacity overflow");
 
-        if new_cap > self.capacity() {
+        if new_cap > old_cap {
             self.buf.reserve_exact(used_cap, new_cap - used_cap);
             unsafe {
                 self.handle_cap_increase(old_cap);
@@ -1920,7 +1922,7 @@ impl<'a, T: 'a + fmt::Debug> fmt::Debug for Iter<'a, T> {
     }
 }
 
-// FIXME(#19839) Remove in favor of `#[derive(Clone)]`
+// FIXME(#26925) Remove in favor of `#[derive(Clone)]`
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<'a, T> Clone for Iter<'a, T> {
     fn clone(&self) -> Iter<'a, T> {
@@ -1970,6 +1972,14 @@ impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
         }
         self.head = wrap_index(self.head.wrapping_sub(1), self.ring.len());
         unsafe { Some(self.ring.get_unchecked(self.head)) }
+    }
+
+    fn rfold<Acc, F>(self, mut accum: Acc, mut f: F) -> Acc
+        where F: FnMut(Acc, Self::Item) -> Acc
+    {
+        let (front, back) = RingSlices::ring_slices(self.ring, self.head, self.tail);
+        accum = back.iter().rfold(accum, &mut f);
+        front.iter().rfold(accum, &mut f)
     }
 }
 
@@ -2055,6 +2065,14 @@ impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
             let elem = self.ring.get_unchecked_mut(self.head);
             Some(&mut *(elem as *mut _))
         }
+    }
+
+    fn rfold<Acc, F>(self, mut accum: Acc, mut f: F) -> Acc
+        where F: FnMut(Acc, Self::Item) -> Acc
+    {
+        let (front, back) = RingSlices::ring_slices(self.ring, self.head, self.tail);
+        accum = back.iter_mut().rfold(accum, &mut f);
+        front.iter_mut().rfold(accum, &mut f)
     }
 }
 
@@ -2394,7 +2412,7 @@ impl<'a, T> IntoIterator for &'a mut VecDeque<T> {
     type Item = &'a mut T;
     type IntoIter = IterMut<'a, T>;
 
-    fn into_iter(mut self) -> IterMut<'a, T> {
+    fn into_iter(self) -> IterMut<'a, T> {
         self.iter_mut()
     }
 }
@@ -2442,7 +2460,7 @@ impl<T> From<Vec<T>> for VecDeque<T> {
             VecDeque {
                 tail: 0,
                 head: len,
-                buf: buf,
+                buf,
             }
         }
     }
@@ -2558,7 +2576,7 @@ impl<'a, T> Place<T> for PlaceBack<'a, T> {
 impl<'a, T> InPlace<T> for PlaceBack<'a, T> {
     type Owner = &'a mut T;
 
-    unsafe fn finalize(mut self) -> &'a mut T {
+    unsafe fn finalize(self) -> &'a mut T {
         let head = self.vec_deque.head;
         self.vec_deque.head = self.vec_deque.wrap_add(head, 1);
         &mut *(self.vec_deque.ptr().offset(head as isize))
@@ -2605,7 +2623,7 @@ impl<'a, T> Place<T> for PlaceFront<'a, T> {
 impl<'a, T> InPlace<T> for PlaceFront<'a, T> {
     type Owner = &'a mut T;
 
-    unsafe fn finalize(mut self) -> &'a mut T {
+    unsafe fn finalize(self) -> &'a mut T {
         self.vec_deque.tail = self.vec_deque.wrap_sub(self.vec_deque.tail, 1);
         &mut *(self.vec_deque.ptr().offset(self.vec_deque.tail as isize))
     }

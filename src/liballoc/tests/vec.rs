@@ -537,27 +537,27 @@ fn test_drain_range() {
 #[test]
 fn test_drain_inclusive_range() {
     let mut v = vec!['a', 'b', 'c', 'd', 'e'];
-    for _ in v.drain(1...3) {
+    for _ in v.drain(1..=3) {
     }
     assert_eq!(v, &['a', 'e']);
 
-    let mut v: Vec<_> = (0...5).map(|x| x.to_string()).collect();
-    for _ in v.drain(1...5) {
+    let mut v: Vec<_> = (0..=5).map(|x| x.to_string()).collect();
+    for _ in v.drain(1..=5) {
     }
     assert_eq!(v, &["0".to_string()]);
 
-    let mut v: Vec<String> = (0...5).map(|x| x.to_string()).collect();
-    for _ in v.drain(0...5) {
+    let mut v: Vec<String> = (0..=5).map(|x| x.to_string()).collect();
+    for _ in v.drain(0..=5) {
     }
     assert_eq!(v, Vec::<String>::new());
 
-    let mut v: Vec<_> = (0...5).map(|x| x.to_string()).collect();
-    for _ in v.drain(0...3) {
+    let mut v: Vec<_> = (0..=5).map(|x| x.to_string()).collect();
+    for _ in v.drain(0..=3) {
     }
     assert_eq!(v, &["4".to_string(), "5".to_string()]);
 
-    let mut v: Vec<_> = (0...1).map(|x| x.to_string()).collect();
-    for _ in v.drain(...0) {
+    let mut v: Vec<_> = (0..=1).map(|x| x.to_string()).collect();
+    for _ in v.drain(..=0) {
     }
     assert_eq!(v, &["1".to_string()]);
 }
@@ -572,7 +572,7 @@ fn test_drain_max_vec_size() {
 
     let mut v = Vec::<()>::with_capacity(usize::max_value());
     unsafe { v.set_len(usize::max_value()); }
-    for _ in v.drain(usize::max_value() - 1...usize::max_value() - 1) {
+    for _ in v.drain(usize::max_value() - 1..=usize::max_value() - 1) {
     }
     assert_eq!(v.len(), usize::max_value() - 1);
 }
@@ -581,7 +581,7 @@ fn test_drain_max_vec_size() {
 #[should_panic]
 fn test_drain_inclusive_out_of_bounds() {
     let mut v = vec![1, 2, 3, 4, 5];
-    v.drain(5...5);
+    v.drain(5..=5);
 }
 
 #[test]
@@ -598,10 +598,10 @@ fn test_splice() {
 fn test_splice_inclusive_range() {
     let mut v = vec![1, 2, 3, 4, 5];
     let a = [10, 11, 12];
-    let t1: Vec<_> = v.splice(2...3, a.iter().cloned()).collect();
+    let t1: Vec<_> = v.splice(2..=3, a.iter().cloned()).collect();
     assert_eq!(v, &[1, 2, 10, 11, 12, 5]);
     assert_eq!(t1, &[3, 4]);
-    let t2: Vec<_> = v.splice(1...2, Some(20)).collect();
+    let t2: Vec<_> = v.splice(1..=2, Some(20)).collect();
     assert_eq!(v, &[1, 20, 11, 12, 5]);
     assert_eq!(t2, &[2, 10]);
 }
@@ -619,7 +619,7 @@ fn test_splice_out_of_bounds() {
 fn test_splice_inclusive_out_of_bounds() {
     let mut v = vec![1, 2, 3, 4, 5];
     let a = [10, 11, 12];
-    v.splice(5...5, a.iter().cloned());
+    v.splice(5..=5, a.iter().cloned());
 }
 
 #[test]
@@ -801,3 +801,170 @@ fn overaligned_allocations() {
         assert!(v.as_ptr() as usize & 0xff == 0);
     }
 }
+
+#[test]
+fn drain_filter_empty() {
+    let mut vec: Vec<i32> = vec![];
+
+    {
+        let mut iter = vec.drain_filter(|_| true);
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+    }
+    assert_eq!(vec.len(), 0);
+    assert_eq!(vec, vec![]);
+}
+
+#[test]
+fn drain_filter_zst() {
+    let mut vec = vec![(), (), (), (), ()];
+    let initial_len = vec.len();
+    let mut count = 0;
+    {
+        let mut iter = vec.drain_filter(|_| true);
+        assert_eq!(iter.size_hint(), (0, Some(initial_len)));
+        while let Some(_) = iter.next() {
+            count += 1;
+            assert_eq!(iter.size_hint(), (0, Some(initial_len - count)));
+        }
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+    }
+
+    assert_eq!(count, initial_len);
+    assert_eq!(vec.len(), 0);
+    assert_eq!(vec, vec![]);
+}
+
+#[test]
+fn drain_filter_false() {
+    let mut vec = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+
+    let initial_len = vec.len();
+    let mut count = 0;
+    {
+        let mut iter = vec.drain_filter(|_| false);
+        assert_eq!(iter.size_hint(), (0, Some(initial_len)));
+        for _ in iter.by_ref() {
+            count += 1;
+        }
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+    }
+
+    assert_eq!(count, 0);
+    assert_eq!(vec.len(), initial_len);
+    assert_eq!(vec, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+}
+
+#[test]
+fn drain_filter_true() {
+    let mut vec = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+
+    let initial_len = vec.len();
+    let mut count = 0;
+    {
+        let mut iter = vec.drain_filter(|_| true);
+        assert_eq!(iter.size_hint(), (0, Some(initial_len)));
+        while let Some(_) = iter.next() {
+            count += 1;
+            assert_eq!(iter.size_hint(), (0, Some(initial_len - count)));
+        }
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+    }
+
+    assert_eq!(count, initial_len);
+    assert_eq!(vec.len(), 0);
+    assert_eq!(vec, vec![]);
+}
+
+#[test]
+fn drain_filter_complex() {
+
+    {   //                [+xxx++++++xxxxx++++x+x++]
+        let mut vec = vec![1,
+                           2, 4, 6,
+                           7, 9, 11, 13, 15, 17,
+                           18, 20, 22, 24, 26,
+                           27, 29, 31, 33,
+                           34,
+                           35,
+                           36,
+                           37, 39];
+
+        let removed = vec.drain_filter(|x| *x % 2 == 0).collect::<Vec<_>>();
+        assert_eq!(removed.len(), 10);
+        assert_eq!(removed, vec![2, 4, 6, 18, 20, 22, 24, 26, 34, 36]);
+
+        assert_eq!(vec.len(), 14);
+        assert_eq!(vec, vec![1, 7, 9, 11, 13, 15, 17, 27, 29, 31, 33, 35, 37, 39]);
+    }
+
+    {   //                [xxx++++++xxxxx++++x+x++]
+        let mut vec = vec![2, 4, 6,
+                           7, 9, 11, 13, 15, 17,
+                           18, 20, 22, 24, 26,
+                           27, 29, 31, 33,
+                           34,
+                           35,
+                           36,
+                           37, 39];
+
+        let removed = vec.drain_filter(|x| *x % 2 == 0).collect::<Vec<_>>();
+        assert_eq!(removed.len(), 10);
+        assert_eq!(removed, vec![2, 4, 6, 18, 20, 22, 24, 26, 34, 36]);
+
+        assert_eq!(vec.len(), 13);
+        assert_eq!(vec, vec![7, 9, 11, 13, 15, 17, 27, 29, 31, 33, 35, 37, 39]);
+    }
+
+    {   //                [xxx++++++xxxxx++++x+x]
+        let mut vec = vec![2, 4, 6,
+                           7, 9, 11, 13, 15, 17,
+                           18, 20, 22, 24, 26,
+                           27, 29, 31, 33,
+                           34,
+                           35,
+                           36];
+
+        let removed = vec.drain_filter(|x| *x % 2 == 0).collect::<Vec<_>>();
+        assert_eq!(removed.len(), 10);
+        assert_eq!(removed, vec![2, 4, 6, 18, 20, 22, 24, 26, 34, 36]);
+
+        assert_eq!(vec.len(), 11);
+        assert_eq!(vec, vec![7, 9, 11, 13, 15, 17, 27, 29, 31, 33, 35]);
+    }
+
+    {   //                [xxxxxxxxxx+++++++++++]
+        let mut vec = vec![2, 4, 6, 8, 10, 12, 14, 16, 18, 20,
+                           1, 3, 5, 7, 9, 11, 13, 15, 17, 19];
+
+        let removed = vec.drain_filter(|x| *x % 2 == 0).collect::<Vec<_>>();
+        assert_eq!(removed.len(), 10);
+        assert_eq!(removed, vec![2, 4, 6, 8, 10, 12, 14, 16, 18, 20]);
+
+        assert_eq!(vec.len(), 10);
+        assert_eq!(vec, vec![1, 3, 5, 7, 9, 11, 13, 15, 17, 19]);
+    }
+
+    {   //                [+++++++++++xxxxxxxxxx]
+        let mut vec = vec![1, 3, 5, 7, 9, 11, 13, 15, 17, 19,
+                           2, 4, 6, 8, 10, 12, 14, 16, 18, 20];
+
+        let removed = vec.drain_filter(|x| *x % 2 == 0).collect::<Vec<_>>();
+        assert_eq!(removed.len(), 10);
+        assert_eq!(removed, vec![2, 4, 6, 8, 10, 12, 14, 16, 18, 20]);
+
+        assert_eq!(vec.len(), 10);
+        assert_eq!(vec, vec![1, 3, 5, 7, 9, 11, 13, 15, 17, 19]);
+    }
+}
+
+

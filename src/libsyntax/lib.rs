@@ -14,9 +14,6 @@
 //!
 //! This API is completely unstable and subject to change.
 
-#![crate_name = "syntax"]
-#![crate_type = "dylib"]
-#![crate_type = "rlib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
        html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
        html_root_url = "https://doc.rust-lang.org/nightly/",
@@ -27,9 +24,13 @@
 #![feature(rustc_diagnostic_macros)]
 #![feature(i128_type)]
 
+// See librustc_cratesio_shim/Cargo.toml for a comment explaining this.
+#[allow(unused_extern_crates)]
+extern crate rustc_cratesio_shim;
+
+#[macro_use] extern crate bitflags;
 extern crate serialize;
 #[macro_use] extern crate log;
-#[macro_use] extern crate bitflags;
 extern crate std_unicode;
 pub extern crate rustc_errors as errors;
 extern crate syntax_pos;
@@ -148,4 +149,4 @@ pub mod ext {
 #[cfg(test)]
 mod test_snippet;
 
-// __build_diagnostic_array! { libsyntax, DIAGNOSTICS }
+__build_diagnostic_array! { libsyntax, DIAGNOSTICS }

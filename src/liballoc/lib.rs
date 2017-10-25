@@ -60,8 +60,6 @@
 //! The [`heap`](heap/index.html) module defines the low-level interface to the
 //! default global allocator. It is not compatible with the libc allocator API.
 
-#![crate_name = "alloc"]
-#![crate_type = "rlib"]
 #![allow(unused_attributes)]
 #![unstable(feature = "alloc",
             reason = "this library is unlikely to be stabilized in its current \
@@ -82,6 +80,7 @@
 #![cfg_attr(not(test), feature(core_float))]
 #![cfg_attr(not(test), feature(exact_size_is_empty))]
 #![cfg_attr(not(test), feature(slice_rotate))]
+#![cfg_attr(not(test), feature(generator_trait))]
 #![cfg_attr(test, feature(rand, test))]
 #![feature(allow_internal_unstable)]
 #![feature(box_patterns)]
@@ -99,6 +98,7 @@
 #![feature(generic_param_attrs)]
 #![feature(i128_type)]
 #![feature(inclusive_range)]
+#![feature(iter_rfold)]
 #![feature(lang_items)]
 #![feature(needs_allocator)]
 #![feature(nonzero)]
@@ -107,6 +107,7 @@
 #![feature(pattern)]
 #![feature(placement_in_syntax)]
 #![feature(placement_new_protocol)]
+#![feature(rustc_attrs)]
 #![feature(shared)]
 #![feature(slice_get_slice)]
 #![feature(slice_patterns)]
@@ -120,8 +121,9 @@
 #![feature(unique)]
 #![feature(unsize)]
 #![feature(allocator_internals)]
+#![feature(on_unimplemented)]
 
-#![cfg_attr(not(test), feature(fused, fn_traits, placement_new_protocol))]
+#![cfg_attr(not(test), feature(fused, fn_traits, placement_new_protocol, swap_with_slice, i128))]
 #![cfg_attr(test, feature(test, box_heap))]
 
 // Allow testing this library

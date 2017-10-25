@@ -125,6 +125,9 @@ pub struct HashSet<T, S = RandomState> {
 impl<T: Hash + Eq> HashSet<T, RandomState> {
     /// Creates an empty `HashSet`.
     ///
+    /// The hash set is initially created with a capacity of 0, so it will not allocate until it
+    /// is first inserted into.
+    ///
     /// # Examples
     ///
     /// ```
@@ -337,7 +340,7 @@ impl<T, S> HashSet<T, S>
     pub fn difference<'a>(&'a self, other: &'a HashSet<T, S>) -> Difference<'a, T, S> {
         Difference {
             iter: self.iter(),
-            other: other,
+            other,
         }
     }
 
@@ -391,7 +394,7 @@ impl<T, S> HashSet<T, S>
     pub fn intersection<'a>(&'a self, other: &'a HashSet<T, S>) -> Intersection<'a, T, S> {
         Intersection {
             iter: self.iter(),
-            other: other,
+            other,
         }
     }
 

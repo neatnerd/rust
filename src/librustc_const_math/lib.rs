@@ -14,17 +14,19 @@
 //!
 //! This API is completely unstable and subject to change.
 
-#![crate_name = "rustc_const_math"]
-#![crate_type = "dylib"]
-#![crate_type = "rlib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
       html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
       html_root_url = "https://doc.rust-lang.org/nightly/")]
 #![deny(warnings)]
 
-#![feature(const_fn)]
 #![feature(i128)]
 #![feature(i128_type)]
+
+#![cfg_attr(stage0, feature(const_fn))]
+#![cfg_attr(not(stage0), feature(const_min_value))]
+#![cfg_attr(not(stage0), feature(const_max_value))]
+
+extern crate rustc_apfloat;
 
 extern crate syntax;
 

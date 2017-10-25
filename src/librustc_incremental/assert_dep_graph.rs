@@ -76,7 +76,7 @@ pub fn assert_dep_graph<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
 
     // Find annotations supplied by user (if any).
     let (if_this_changed, then_this_would_need) = {
-        let mut visitor = IfThisChanged { tcx: tcx,
+        let mut visitor = IfThisChanged { tcx,
                                           if_this_changed: vec![],
                                           then_this_would_need: vec![] };
         visitor.process_attrs(ast::CRATE_NODE_ID, &tcx.hir.krate().attrs);
@@ -209,7 +209,7 @@ fn check_paths<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     }
     let query = tcx.dep_graph.query();
     for &(_, source_def_id, ref source_dep_node) in if_this_changed {
-        let dependents = query.transitive_successors(source_dep_node);
+        let dependents = query.transitive_predecessors(source_dep_node);
         for &(target_span, ref target_pass, _, ref target_dep_node) in then_this_would_need {
             if !dependents.contains(&target_dep_node) {
                 tcx.sess.span_err(

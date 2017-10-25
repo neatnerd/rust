@@ -19,7 +19,7 @@
 //! given value is destroyed, the pointed-to value is also destroyed.
 //!
 //! Shared references in Rust disallow mutation by default, and [`Rc`]
-//! is no exception: you cannot obtain a mutable reference to
+//! is no exception: you cannot generally obtain a mutable reference to
 //! something inside an [`Rc`]. If you need mutability, put a [`Cell`]
 //! or [`RefCell`] inside the [`Rc`]; see [an example of mutability
 //! inside an Rc][mutability].
@@ -244,6 +244,7 @@ use boxed::Box;
 #[cfg(test)]
 use std::boxed::Box;
 
+use core::any::Any;
 use core::borrow;
 use core::cell::Cell;
 use core::cmp::Ordering;
@@ -252,14 +253,15 @@ use core::hash::{Hash, Hasher};
 use core::intrinsics::abort;
 use core::marker;
 use core::marker::Unsize;
-use core::mem::{self, forget, size_of, size_of_val, uninitialized};
+use core::mem::{self, align_of_val, forget, size_of_val, uninitialized};
 use core::ops::Deref;
 use core::ops::CoerceUnsized;
 use core::ptr::{self, Shared};
 use core::convert::From;
 
 use heap::{Heap, Alloc, Layout, box_free};
-use raw_vec::RawVec;
+use string::String;
+use vec::Vec;
 
 struct RcBox<T: ?Sized> {
     strong: Cell<usize>,
@@ -311,7 +313,7 @@ impl<T> Rc<T> {
             ptr: Shared::from(Box::into_unique(box RcBox {
                 strong: Cell::new(1),
                 weak: Cell::new(1),
-                value: value,
+                value,
             })),
         }
     }
@@ -357,7 +359,9 @@ impl<T> Rc<T> {
             Err(this)
         }
     }
+}
 
+impl<T: ?Sized> Rc<T> {
     /// Consumes the `Rc`, returning the wrapped pointer.
     ///
     /// To avoid a memory leak the pointer must be converted back to an `Rc` using
@@ -411,75 +415,21 @@ impl<T> Rc<T> {
     /// ```
     #[stable(feature = "rc_raw", since = "1.17.0")]
     pub unsafe fn from_raw(ptr: *const T) -> Self {
-        // To find the corresponding pointer to the `RcBox` we need to subtract the offset of the
-        // `value` field from the pointer.
+        // Align the unsized value to the end of the RcBox.
+        // Because it is ?Sized, it will always be the last field in memory.
+        let align = align_of_val(&*ptr);
+        let layout = Layout::new::<RcBox<()>>();
+        let offset = (layout.size() + layout.padding_needed_for(align)) as isize;
 
-        let ptr = (ptr as *const u8).offset(-offset_of!(RcBox<T>, value));
+        // Reverse the offset to find the original RcBox.
+        let fake_ptr = ptr as *mut RcBox<T>;
+        let rc_ptr = set_data_ptr(fake_ptr, (ptr as *mut u8).offset(-offset));
+
         Rc {
-            ptr: Shared::new_unchecked(ptr as *mut u8 as *mut _)
+            ptr: Shared::new_unchecked(rc_ptr),
         }
     }
-}
 
-impl Rc<str> {
-    /// Constructs a new `Rc<str>` from a string slice.
-    #[doc(hidden)]
-    #[unstable(feature = "rustc_private",
-               reason = "for internal use in rustc",
-               issue = "27812")]
-    pub fn __from_str(value: &str) -> Rc<str> {
-        unsafe {
-            // Allocate enough space for `RcBox<str>`.
-            let aligned_len = 2 + (value.len() + size_of::<usize>() - 1) / size_of::<usize>();
-            let vec = RawVec::<usize>::with_capacity(aligned_len);
-            let ptr = vec.ptr();
-            forget(vec);
-            // Initialize fields of `RcBox<str>`.
-            *ptr.offset(0) = 1; // strong: Cell::new(1)
-            *ptr.offset(1) = 1; // weak: Cell::new(1)
-            ptr::copy_nonoverlapping(value.as_ptr(), ptr.offset(2) as *mut u8, value.len());
-            // Combine the allocation address and the string length into a fat pointer to `RcBox`.
-            let rcbox_ptr: *mut RcBox<str> = mem::transmute([ptr as usize, value.len()]);
-            assert!(aligned_len * size_of::<usize>() == size_of_val(&*rcbox_ptr));
-            Rc { ptr: Shared::new_unchecked(rcbox_ptr) }
-        }
-    }
-}
-
-impl<T> Rc<[T]> {
-    /// Constructs a new `Rc<[T]>` from a `Box<[T]>`.
-    #[doc(hidden)]
-    #[unstable(feature = "rustc_private",
-               reason = "for internal use in rustc",
-               issue = "27812")]
-    pub fn __from_array(value: Box<[T]>) -> Rc<[T]> {
-        unsafe {
-            let ptr: *mut RcBox<[T]> =
-                mem::transmute([mem::align_of::<RcBox<[T; 1]>>(), value.len()]);
-            // FIXME(custom-DST): creating this invalid &[T] is dubiously defined,
-            // we should have a better way of getting the size/align
-            // of a DST from its unsized part.
-            let ptr = Heap.alloc(Layout::for_value(&*ptr))
-                .unwrap_or_else(|e| Heap.oom(e));
-            let ptr: *mut RcBox<[T]> = mem::transmute([ptr as usize, value.len()]);
-
-            // Initialize the new RcBox.
-            ptr::write(&mut (*ptr).strong, Cell::new(1));
-            ptr::write(&mut (*ptr).weak, Cell::new(1));
-            ptr::copy_nonoverlapping(
-                value.as_ptr(),
-                &mut (*ptr).value as *mut [T] as *mut T,
-                value.len());
-
-            // Free the original allocation without freeing its (moved) contents.
-            box_free(Box::into_raw(value));
-
-            Rc { ptr: Shared::new_unchecked(ptr as *mut _) }
-        }
-    }
-}
-
-impl<T: ?Sized> Rc<T> {
     /// Creates a new [`Weak`][weak] pointer to this value.
     ///
     /// [weak]: struct.Weak.html
@@ -662,6 +612,180 @@ impl<T: Clone> Rc<T> {
         unsafe {
             &mut this.ptr.as_mut().value
         }
+    }
+}
+
+impl Rc<Any> {
+    #[inline]
+    #[unstable(feature = "rc_downcast", issue = "44608")]
+    /// Attempt to downcast the `Rc<Any>` to a concrete type.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(rc_downcast)]
+    /// use std::any::Any;
+    /// use std::rc::Rc;
+    ///
+    /// fn print_if_string(value: Rc<Any>) {
+    ///     if let Ok(string) = value.downcast::<String>() {
+    ///         println!("String ({}): {}", string.len(), string);
+    ///     }
+    /// }
+    ///
+    /// fn main() {
+    ///     let my_string = "Hello World".to_string();
+    ///     print_if_string(Rc::new(my_string));
+    ///     print_if_string(Rc::new(0i8));
+    /// }
+    /// ```
+    pub fn downcast<T: Any>(self) -> Result<Rc<T>, Rc<Any>> {
+        if (*self).is::<T>() {
+            // avoid the pointer arithmetic in from_raw
+            unsafe {
+                let raw: *const RcBox<Any> = self.ptr.as_ptr();
+                forget(self);
+                Ok(Rc {
+                    ptr: Shared::new_unchecked(raw as *const RcBox<T> as *mut _),
+                })
+            }
+        } else {
+            Err(self)
+        }
+    }
+}
+
+impl<T: ?Sized> Rc<T> {
+    // Allocates an `RcBox<T>` with sufficient space for an unsized value
+    unsafe fn allocate_for_ptr(ptr: *const T) -> *mut RcBox<T> {
+        // Create a fake RcBox to find allocation size and alignment
+        let fake_ptr = ptr as *mut RcBox<T>;
+
+        let layout = Layout::for_value(&*fake_ptr);
+
+        let mem = Heap.alloc(layout)
+            .unwrap_or_else(|e| Heap.oom(e));
+
+        // Initialize the real RcBox
+        let inner = set_data_ptr(ptr as *mut T, mem) as *mut RcBox<T>;
+
+        ptr::write(&mut (*inner).strong, Cell::new(1));
+        ptr::write(&mut (*inner).weak, Cell::new(1));
+
+        inner
+    }
+
+    fn from_box(v: Box<T>) -> Rc<T> {
+        unsafe {
+            let bptr = Box::into_raw(v);
+
+            let value_size = size_of_val(&*bptr);
+            let ptr = Self::allocate_for_ptr(bptr);
+
+            // Copy value as bytes
+            ptr::copy_nonoverlapping(
+                bptr as *const T as *const u8,
+                &mut (*ptr).value as *mut _ as *mut u8,
+                value_size);
+
+            // Free the allocation without dropping its contents
+            box_free(bptr);
+
+            Rc { ptr: Shared::new_unchecked(ptr) }
+        }
+    }
+}
+
+// Sets the data pointer of a `?Sized` raw pointer.
+//
+// For a slice/trait object, this sets the `data` field and leaves the rest
+// unchanged. For a sized raw pointer, this simply sets the pointer.
+unsafe fn set_data_ptr<T: ?Sized, U>(mut ptr: *mut T, data: *mut U) -> *mut T {
+    ptr::write(&mut ptr as *mut _ as *mut *mut u8, data as *mut u8);
+    ptr
+}
+
+impl<T> Rc<[T]> {
+    // Copy elements from slice into newly allocated Rc<[T]>
+    //
+    // Unsafe because the caller must either take ownership or bind `T: Copy`
+    unsafe fn copy_from_slice(v: &[T]) -> Rc<[T]> {
+        let v_ptr = v as *const [T];
+        let ptr = Self::allocate_for_ptr(v_ptr);
+
+        ptr::copy_nonoverlapping(
+            v.as_ptr(),
+            &mut (*ptr).value as *mut [T] as *mut T,
+            v.len());
+
+        Rc { ptr: Shared::new_unchecked(ptr) }
+    }
+}
+
+trait RcFromSlice<T> {
+    fn from_slice(slice: &[T]) -> Self;
+}
+
+impl<T: Clone> RcFromSlice<T> for Rc<[T]> {
+    #[inline]
+    default fn from_slice(v: &[T]) -> Self {
+        // Panic guard while cloning T elements.
+        // In the event of a panic, elements that have been written
+        // into the new RcBox will be dropped, then the memory freed.
+        struct Guard<T> {
+            mem: *mut u8,
+            elems: *mut T,
+            layout: Layout,
+            n_elems: usize,
+        }
+
+        impl<T> Drop for Guard<T> {
+            fn drop(&mut self) {
+                use core::slice::from_raw_parts_mut;
+
+                unsafe {
+                    let slice = from_raw_parts_mut(self.elems, self.n_elems);
+                    ptr::drop_in_place(slice);
+
+                    Heap.dealloc(self.mem, self.layout.clone());
+                }
+            }
+        }
+
+        unsafe {
+            let v_ptr = v as *const [T];
+            let ptr = Self::allocate_for_ptr(v_ptr);
+
+            let mem = ptr as *mut _ as *mut u8;
+            let layout = Layout::for_value(&*ptr);
+
+            // Pointer to first element
+            let elems = &mut (*ptr).value as *mut [T] as *mut T;
+
+            let mut guard = Guard{
+                mem: mem,
+                elems: elems,
+                layout: layout,
+                n_elems: 0,
+            };
+
+            for (i, item) in v.iter().enumerate() {
+                ptr::write(elems.offset(i as isize), item.clone());
+                guard.n_elems += 1;
+            }
+
+            // All clear. Forget the guard so it doesn't free the new RcBox.
+            forget(guard);
+
+            Rc { ptr: Shared::new_unchecked(ptr) }
+        }
+    }
+}
+
+impl<T: Copy> RcFromSlice<T> for Rc<[T]> {
+    #[inline]
+    fn from_slice(v: &[T]) -> Self {
+        unsafe { Rc::copy_from_slice(v) }
     }
 }
 
@@ -956,6 +1080,53 @@ impl<T: ?Sized> fmt::Pointer for Rc<T> {
 impl<T> From<T> for Rc<T> {
     fn from(t: T) -> Self {
         Rc::new(t)
+    }
+}
+
+#[stable(feature = "shared_from_slice", since = "1.21.0")]
+impl<'a, T: Clone> From<&'a [T]> for Rc<[T]> {
+    #[inline]
+    fn from(v: &[T]) -> Rc<[T]> {
+        <Self as RcFromSlice<T>>::from_slice(v)
+    }
+}
+
+#[stable(feature = "shared_from_slice", since = "1.21.0")]
+impl<'a> From<&'a str> for Rc<str> {
+    #[inline]
+    fn from(v: &str) -> Rc<str> {
+        unsafe { mem::transmute(<Rc<[u8]>>::from(v.as_bytes())) }
+    }
+}
+
+#[stable(feature = "shared_from_slice", since = "1.21.0")]
+impl From<String> for Rc<str> {
+    #[inline]
+    fn from(v: String) -> Rc<str> {
+        Rc::from(&v[..])
+    }
+}
+
+#[stable(feature = "shared_from_slice", since = "1.21.0")]
+impl<T: ?Sized> From<Box<T>> for Rc<T> {
+    #[inline]
+    fn from(v: Box<T>) -> Rc<T> {
+        Rc::from_box(v)
+    }
+}
+
+#[stable(feature = "shared_from_slice", since = "1.21.0")]
+impl<T> From<Vec<T>> for Rc<[T]> {
+    #[inline]
+    fn from(mut v: Vec<T>) -> Rc<[T]> {
+        unsafe {
+            let rc = Rc::copy_from_slice(&v);
+
+            // Allow the Vec to free its memory, but not destroy its contents
+            v.set_len(0);
+
+            rc
+        }
     }
 }
 
@@ -1358,6 +1529,28 @@ mod tests {
     }
 
     #[test]
+    fn test_into_from_raw_unsized() {
+        use std::fmt::Display;
+        use std::string::ToString;
+
+        let rc: Rc<str> = Rc::from("foo");
+
+        let ptr = Rc::into_raw(rc.clone());
+        let rc2 = unsafe { Rc::from_raw(ptr) };
+
+        assert_eq!(unsafe { &*ptr }, "foo");
+        assert_eq!(rc, rc2);
+
+        let rc: Rc<Display> = Rc::new(123);
+
+        let ptr = Rc::into_raw(rc.clone());
+        let rc2 = unsafe { Rc::from_raw(ptr) };
+
+        assert_eq!(unsafe { &*ptr }.to_string(), "123");
+        assert_eq!(rc2.to_string(), "123");
+    }
+
+    #[test]
     fn get_mut() {
         let mut x = Rc::new(3);
         *Rc::get_mut(&mut x).unwrap() = 4;
@@ -1464,6 +1657,133 @@ mod tests {
 
         assert!(Rc::ptr_eq(&five, &same_five));
         assert!(!Rc::ptr_eq(&five, &other_five));
+    }
+
+    #[test]
+    fn test_from_str() {
+        let r: Rc<str> = Rc::from("foo");
+
+        assert_eq!(&r[..], "foo");
+    }
+
+    #[test]
+    fn test_copy_from_slice() {
+        let s: &[u32] = &[1, 2, 3];
+        let r: Rc<[u32]> = Rc::from(s);
+
+        assert_eq!(&r[..], [1, 2, 3]);
+    }
+
+    #[test]
+    fn test_clone_from_slice() {
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        struct X(u32);
+
+        let s: &[X] = &[X(1), X(2), X(3)];
+        let r: Rc<[X]> = Rc::from(s);
+
+        assert_eq!(&r[..], s);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_clone_from_slice_panic() {
+        use std::string::{String, ToString};
+
+        struct Fail(u32, String);
+
+        impl Clone for Fail {
+            fn clone(&self) -> Fail {
+                if self.0 == 2 {
+                    panic!();
+                }
+                Fail(self.0, self.1.clone())
+            }
+        }
+
+        let s: &[Fail] = &[
+            Fail(0, "foo".to_string()),
+            Fail(1, "bar".to_string()),
+            Fail(2, "baz".to_string()),
+        ];
+
+        // Should panic, but not cause memory corruption
+        let _r: Rc<[Fail]> = Rc::from(s);
+    }
+
+    #[test]
+    fn test_from_box() {
+        let b: Box<u32> = box 123;
+        let r: Rc<u32> = Rc::from(b);
+
+        assert_eq!(*r, 123);
+    }
+
+    #[test]
+    fn test_from_box_str() {
+        use std::string::String;
+
+        let s = String::from("foo").into_boxed_str();
+        let r: Rc<str> = Rc::from(s);
+
+        assert_eq!(&r[..], "foo");
+    }
+
+    #[test]
+    fn test_from_box_slice() {
+        let s = vec![1, 2, 3].into_boxed_slice();
+        let r: Rc<[u32]> = Rc::from(s);
+
+        assert_eq!(&r[..], [1, 2, 3]);
+    }
+
+    #[test]
+    fn test_from_box_trait() {
+        use std::fmt::Display;
+        use std::string::ToString;
+
+        let b: Box<Display> = box 123;
+        let r: Rc<Display> = Rc::from(b);
+
+        assert_eq!(r.to_string(), "123");
+    }
+
+    #[test]
+    fn test_from_box_trait_zero_sized() {
+        use std::fmt::Debug;
+
+        let b: Box<Debug> = box ();
+        let r: Rc<Debug> = Rc::from(b);
+
+        assert_eq!(format!("{:?}", r), "()");
+    }
+
+    #[test]
+    fn test_from_vec() {
+        let v = vec![1, 2, 3];
+        let r: Rc<[u32]> = Rc::from(v);
+
+        assert_eq!(&r[..], [1, 2, 3]);
+    }
+
+    #[test]
+    fn test_downcast() {
+        use std::any::Any;
+
+        let r1: Rc<Any> = Rc::new(i32::max_value());
+        let r2: Rc<Any> = Rc::new("abc");
+
+        assert!(r1.clone().downcast::<u32>().is_err());
+
+        let r1i32 = r1.downcast::<i32>();
+        assert!(r1i32.is_ok());
+        assert_eq!(r1i32.unwrap(), Rc::new(i32::max_value()));
+
+        assert!(r2.clone().downcast::<i32>().is_err());
+
+        let r2str = r2.downcast::<&'static str>();
+        assert!(r2str.is_ok());
+        assert_eq!(r2str.unwrap(), Rc::new("abc"));
     }
 }
 

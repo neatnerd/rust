@@ -14,14 +14,15 @@
 //! We walk the set of items and, for each member, generate new constraints.
 
 use hir::def_id::DefId;
-use rustc::dep_graph::{AssertDepGraphSafe, DepKind};
+use rustc::dep_graph::{DepGraphSafe, DepKind, DepNodeColor};
+use rustc::ich::StableHashingContext;
 use rustc::ty::subst::Substs;
 use rustc::ty::{self, Ty, TyCtxt};
 use syntax::ast;
 use rustc::hir;
 use rustc::hir::itemlikevisit::ItemLikeVisitor;
 
-use rustc_data_structures::transitive_relation::TransitiveRelation;
+use rustc_data_structures::stable_hasher::StableHashingContextProvider;
 
 use super::terms::*;
 use super::terms::VarianceTerm::*;
@@ -36,11 +37,6 @@ pub struct ConstraintContext<'a, 'tcx: 'a> {
     bivariant: VarianceTermPtr<'a>,
 
     pub constraints: Vec<Constraint<'a>>,
-
-    /// This relation tracks the dependencies between the variance of
-    /// various items. In particular, if `a < b`, then the variance of
-    /// `a` depends on the sources of `b`.
-    pub dependencies: TransitiveRelation<DefId>,
 }
 
 /// Declares that the variable `decl_id` appears in a location with
@@ -51,7 +47,7 @@ pub struct Constraint<'a> {
     pub variance: &'a VarianceTerm<'a>,
 }
 
-/// To build constriants, we visit one item (type, trait) at a time
+/// To build constraints, we visit one item (type, trait) at a time
 /// and look at its contents. So e.g. if we have
 ///
 ///     struct Foo<T> {
@@ -61,7 +57,6 @@ pub struct Constraint<'a> {
 /// then while we are visiting `Bar<T>`, the `CurrentItem` would have
 /// the def-id and the start of `Foo`'s inferreds.
 pub struct CurrentItem {
-    def_id: DefId,
     inferred_start: InferredIndex,
 }
 
@@ -73,13 +68,12 @@ pub fn add_constraints_from_crate<'a, 'tcx>(terms_cx: TermsContext<'a, 'tcx>)
     let invariant = terms_cx.arena.alloc(ConstantTerm(ty::Invariant));
     let bivariant = terms_cx.arena.alloc(ConstantTerm(ty::Bivariant));
     let mut constraint_cx = ConstraintContext {
-        terms_cx: terms_cx,
-        covariant: covariant,
-        contravariant: contravariant,
-        invariant: invariant,
-        bivariant: bivariant,
+        terms_cx,
+        covariant,
+        contravariant,
+        invariant,
+        bivariant,
         constraints: Vec::new(),
-        dependencies: TransitiveRelation::new(),
     };
 
     tcx.hir.krate().visit_all_item_likes(&mut constraint_cx);
@@ -138,6 +132,16 @@ impl<'a, 'tcx, 'v> ItemLikeVisitor<'v> for ConstraintContext<'a, 'tcx> {
     }
 }
 
+impl<'a, 'tcx> StableHashingContextProvider for ConstraintContext<'a, 'tcx> {
+    type ContextType = StableHashingContext<'tcx>;
+
+    fn create_stable_hashing_context(&self) -> Self::ContextType {
+         self.terms_cx.tcx.create_stable_hashing_context()
+    }
+}
+
+impl<'a, 'tcx> DepGraphSafe for ConstraintContext<'a, 'tcx> {}
+
 impl<'a, 'tcx> ConstraintContext<'a, 'tcx> {
     fn visit_node_helper(&mut self, id: ast::NodeId) {
         let tcx = self.terms_cx.tcx;
@@ -150,15 +154,27 @@ impl<'a, 'tcx> ConstraintContext<'a, 'tcx> {
         // See README.md for a detailed discussion
         // on dep-graph management.
         let dep_node = def_id.to_dep_node(tcx, DepKind::ItemVarianceConstraints);
-        tcx.dep_graph.with_task(dep_node,
-                                AssertDepGraphSafe(self),
-                                def_id,
-                                visit_item_task);
 
-        fn visit_item_task<'a, 'tcx>(ccx: AssertDepGraphSafe<&mut ConstraintContext<'a, 'tcx>>,
+        if let Some(DepNodeColor::Green(_)) = tcx.dep_graph.node_color(&dep_node) {
+            // If the corresponding node has already been marked as green, the
+            // appropriate portion of the DepGraph has already been loaded from
+            // the previous graph, so we don't do any dep-tracking. Since we
+            // don't cache any values though, we still have to re-run the
+            // computation.
+            tcx.dep_graph.with_ignore(|| {
+                self.build_constraints_for_item(def_id);
+            });
+        } else {
+            tcx.dep_graph.with_task(dep_node,
+                                    self,
+                                    def_id,
+                                    visit_item_task);
+        }
+
+        fn visit_item_task<'a, 'tcx>(ccx: &mut ConstraintContext<'a, 'tcx>,
                                      def_id: DefId)
         {
-            ccx.0.build_constraints_for_item(def_id);
+            ccx.build_constraints_for_item(def_id);
         }
     }
 
@@ -177,7 +193,7 @@ impl<'a, 'tcx> ConstraintContext<'a, 'tcx> {
 
         let id = tcx.hir.as_local_node_id(def_id).unwrap();
         let inferred_start = self.terms_cx.inferred_starts[&id];
-        let current_item = &CurrentItem { def_id, inferred_start };
+        let current_item = &CurrentItem { inferred_start };
         match tcx.type_of(def_id).sty {
             ty::TyAdt(def, _) => {
                 // Not entirely obvious: constraints on structs/enums do not
@@ -213,7 +229,7 @@ impl<'a, 'tcx> ConstraintContext<'a, 'tcx> {
         debug!("add_constraint(index={}, variance={:?})", index, variance);
         self.constraints.push(Constraint {
             inferred: InferredIndex(current.inferred_start.0 + index as usize),
-            variance: variance,
+            variance,
         });
     }
 
@@ -294,6 +310,7 @@ impl<'a, 'tcx> ConstraintContext<'a, 'tcx> {
             }
 
             ty::TyFnDef(..) |
+            ty::TyGenerator(..) |
             ty::TyClosure(..) => {
                 bug!("Unexpected closure type in variance computation");
             }
@@ -383,12 +400,6 @@ impl<'a, 'tcx> ConstraintContext<'a, 'tcx> {
         // We don't record `inferred_starts` entries for empty generics.
         if substs.is_empty() {
             return;
-        }
-
-        // Add a corresponding relation into the dependencies to
-        // indicate that the variance for `current` relies on `def_id`.
-        if self.tcx().dep_graph.is_fully_enabled() {
-            self.dependencies.add(current.def_id, def_id);
         }
 
         let (local, remote) = if let Some(id) = self.tcx().hir.as_local_node_id(def_id) {

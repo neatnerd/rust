@@ -38,10 +38,16 @@ impl Condvar {
         Condvar { inner: UnsafeCell::new(libc::PTHREAD_COND_INITIALIZER) }
     }
 
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
+    #[cfg(any(target_os = "macos",
+              target_os = "ios",
+              target_os = "l4re",
+              target_os = "android"))]
     pub unsafe fn init(&mut self) {}
 
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+    #[cfg(not(any(target_os = "macos",
+                  target_os = "ios",
+                  target_os = "l4re",
+                  target_os = "android")))]
     pub unsafe fn init(&mut self) {
         use mem;
         let mut attr: libc::pthread_condattr_t = mem::uninitialized();
@@ -86,14 +92,15 @@ impl Condvar {
         assert_eq!(r, 0);
 
         // Nanosecond calculations can't overflow because both values are below 1e9.
-        let nsec = dur.subsec_nanos() as libc::c_long + now.tv_nsec as libc::c_long;
+        let nsec = dur.subsec_nanos() + now.tv_nsec as u32;
+
         let sec = saturating_cast_to_time_t(dur.as_secs())
             .checked_add((nsec / 1_000_000_000) as libc::time_t)
             .and_then(|s| s.checked_add(now.tv_sec));
         let nsec = nsec % 1_000_000_000;
 
         let timeout = sec.map(|s| {
-            libc::timespec { tv_sec: s, tv_nsec: nsec }
+            libc::timespec { tv_sec: s, tv_nsec: nsec as _}
         }).unwrap_or(TIMESPEC_MAX);
 
         let r = libc::pthread_cond_timedwait(self.inner.get(), mutex::raw(mutex),

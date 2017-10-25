@@ -11,9 +11,9 @@
 //! Error Reporting for Anonymous Region Lifetime Errors
 //! where one region is named and the other is anonymous.
 use infer::InferCtxt;
-use ty;
 use infer::region_inference::RegionResolutionError::*;
 use infer::region_inference::RegionResolutionError;
+use ty;
 
 impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
     // This method generates the error message for the case when
@@ -25,51 +25,64 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
             _ => return false, // inapplicable
         };
 
+        debug!("try_report_named_anon_conflict(sub={:?}, sup={:?})",
+               sub,
+               sup);
+
         // Determine whether the sub and sup consist of one named region ('a)
         // and one anonymous (elided) region. If so, find the parameter arg
         // where the anonymous region appears (there must always be one; we
         // only introduced anonymous regions in parameters) as well as a
         // version new_ty of its type where the anonymous region is replaced
-        // with the named one.
-        let (named, (arg, new_ty, br, is_first), (scope_def_id, _)) =
-            if sub.is_named_region() && self.is_suitable_anonymous_region(sup).is_some() {
+        // with the named one.//scope_def_id
+        let (named, anon, anon_arg_info, region_info) =
+            if self.is_named_region(sub) && self.is_suitable_region(sup).is_some() &&
+               self.find_arg_with_region(sup, sub).is_some() {
                 (sub,
-                 self.find_arg_with_anonymous_region(sup, sub).unwrap(),
-                 self.is_suitable_anonymous_region(sup).unwrap())
-            } else if sup.is_named_region() && self.is_suitable_anonymous_region(sub).is_some() {
+                 sup,
+                 self.find_arg_with_region(sup, sub).unwrap(),
+                 self.is_suitable_region(sup).unwrap())
+            } else if self.is_named_region(sup) && self.is_suitable_region(sub).is_some() &&
+                      self.find_arg_with_region(sub, sup).is_some() {
                 (sup,
-                 self.find_arg_with_anonymous_region(sub, sup).unwrap(),
-                 self.is_suitable_anonymous_region(sub).unwrap())
+                 sub,
+                 self.find_arg_with_region(sub, sup).unwrap(),
+                 self.is_suitable_region(sub).unwrap())
             } else {
                 return false; // inapplicable
             };
 
-        // Here, we check for the case where the anonymous region
-        // is in the return type.
-        // FIXME(#42703) - Need to handle certain cases here.
-        let ret_ty = self.tcx.type_of(scope_def_id);
-        match ret_ty.sty {
-            ty::TyFnDef(_, _) => {
-                let sig = ret_ty.fn_sig(self.tcx);
-                let late_bound_regions = self.tcx
-                    .collect_referenced_late_bound_regions(&sig.output());
-                if late_bound_regions.iter().any(|r| *r == br) {
-                    return false;
-                }
+        debug!("try_report_named_anon_conflict: named = {:?}", named);
+        debug!("try_report_named_anon_conflict: anon_arg_info = {:?}",
+               anon_arg_info);
+        debug!("try_report_named_anon_conflict: region_info = {:?}",
+               region_info);
+
+        let (arg, new_ty, br, is_first, scope_def_id, is_impl_item) = (anon_arg_info.arg,
+                                                                       anon_arg_info.arg_ty,
+                                                                       anon_arg_info.bound_region,
+                                                                       anon_arg_info.is_first,
+                                                                       region_info.def_id,
+                                                                       region_info.is_impl_item);
+        match br {
+            ty::BrAnon(_) => {}
+            _ => {
+                /* not an anonymous region */
+                debug!("try_report_named_anon_conflict: not an anonymous region");
+                return false;
             }
-            _ => {}
         }
 
-        // Here we check for the case where anonymous region
-        // corresponds to self and if yes, we display E0312.
-        // FIXME(#42700) - Need to format self properly to
-        // enable E0621 for it.
-        if is_first &&
-           self.tcx
-               .opt_associated_item(scope_def_id)
-               .map(|i| i.method_has_self_argument)
-               .unwrap_or(false) {
+        if is_impl_item {
+            debug!("try_report_named_anon_conflict: impl item, bail out");
             return false;
+        }
+
+        if let Some((_, fndecl)) = self.find_anon_type(anon, &br) {
+            if self.is_return_type_anon(scope_def_id, br, fndecl).is_some() ||
+               self.is_self_anon(is_first, scope_def_id) {
+                return false;
+            }
         }
 
         let (error_var, span_label_var) = if let Some(simple_name) = arg.pat.simple_name() {
@@ -87,7 +100,7 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
                             format!("consider changing {} to `{}`", span_label_var, new_ty))
                 .span_label(span, format!("lifetime `{}` required", named))
                 .emit();
-
         return true;
+
     }
 }

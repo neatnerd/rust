@@ -435,10 +435,10 @@ pub fn mk_attr_inner(span: Span, id: AttrId, item: MetaItem) -> Attribute {
     mk_spanned_attr_inner(span, id, item)
 }
 
-/// Returns an innter attribute with the given value and span.
+/// Returns an inner attribute with the given value and span.
 pub fn mk_spanned_attr_inner(sp: Span, id: AttrId, item: MetaItem) -> Attribute {
     Attribute {
-        id: id,
+        id,
         style: ast::AttrStyle::Inner,
         path: ast::Path::from_ident(item.span, ast::Ident::with_empty_ctxt(item.name)),
         tokens: item.node.tokens(item.span),
@@ -456,7 +456,7 @@ pub fn mk_attr_outer(span: Span, id: AttrId, item: MetaItem) -> Attribute {
 /// Returns an outer attribute with the given value and span.
 pub fn mk_spanned_attr_outer(sp: Span, id: AttrId, item: MetaItem) -> Attribute {
     Attribute {
-        id: id,
+        id,
         style: ast::AttrStyle::Outer,
         path: ast::Path::from_ident(item.span, ast::Ident::with_empty_ctxt(item.name)),
         tokens: item.node.tokens(item.span),
@@ -469,12 +469,12 @@ pub fn mk_sugared_doc_attr(id: AttrId, text: Symbol, span: Span) -> Attribute {
     let style = doc_comment_style(&text.as_str());
     let lit = respan(span, LitKind::Str(text, ast::StrStyle::Cooked));
     Attribute {
-        id: id,
-        style: style,
+        id,
+        style,
         path: ast::Path::from_ident(span, ast::Ident::from_str("doc")),
         tokens: MetaItemKind::NameValue(lit).tokens(span),
         is_sugared_doc: true,
-        span: span,
+        span,
     }
 }
 
@@ -490,40 +490,34 @@ pub fn contains_name(attrs: &[Attribute], name: &str) -> bool {
     })
 }
 
+pub fn find_by_name<'a>(attrs: &'a [Attribute], name: &str) -> Option<&'a Attribute> {
+    attrs.iter().find(|attr| attr.check_name(name))
+}
+
 pub fn first_attr_value_str_by_name(attrs: &[Attribute], name: &str) -> Option<Symbol> {
     attrs.iter()
         .find(|at| at.check_name(name))
         .and_then(|at| at.value_str())
 }
 
+/// Check if `attrs` contains an attribute like `#![feature(feature_name)]`.
+/// This will not perform any "sanity checks" on the form of the attributes.
+pub fn contains_feature_attr(attrs: &[Attribute], feature_name: &str) -> bool {
+    attrs.iter().any(|item| {
+        item.check_name("feature") &&
+        item.meta_item_list().map(|list| {
+            list.iter().any(|mi| {
+                mi.word().map(|w| w.name() == feature_name)
+                         .unwrap_or(false)
+            })
+        }).unwrap_or(false)
+    })
+}
+
 /* Higher-level applications */
 
 pub fn find_crate_name(attrs: &[Attribute]) -> Option<Symbol> {
     first_attr_value_str_by_name(attrs, "crate_name")
-}
-
-/// Find the value of #[export_name=*] attribute and check its validity.
-pub fn find_export_name_attr(diag: &Handler, attrs: &[Attribute]) -> Option<Symbol> {
-    attrs.iter().fold(None, |ia,attr| {
-        if attr.check_name("export_name") {
-            if let s@Some(_) = attr.value_str() {
-                s
-            } else {
-                struct_span_err!(diag, attr.span, E0558,
-                                 "export_name attribute has invalid format")
-                    .span_label(attr.span, "did you mean #[export_name=\"*\"]?")
-                    .emit();
-                None
-            }
-        } else {
-            ia
-        }
-    })
-}
-
-pub fn contains_extern_indicator(diag: &Handler, attrs: &[Attribute]) -> bool {
-    contains_name(attrs, "no_mangle") ||
-        find_export_name_attr(diag, attrs).is_some()
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -581,6 +575,20 @@ pub fn requests_inline(attrs: &[Attribute]) -> bool {
 
 /// Tests if a cfg-pattern matches the cfg set
 pub fn cfg_matches(cfg: &ast::MetaItem, sess: &ParseSess, features: Option<&Features>) -> bool {
+    eval_condition(cfg, sess, &mut |cfg| {
+        if let (Some(feats), Some(gated_cfg)) = (features, GatedCfg::gate(cfg)) {
+            gated_cfg.check_and_emit(sess, feats);
+        }
+        sess.config.contains(&(cfg.name(), cfg.value_str()))
+    })
+}
+
+/// Evaluate a cfg-like condition (with `any` and `all`), using `eval` to
+/// evaluate individual items.
+pub fn eval_condition<F>(cfg: &ast::MetaItem, sess: &ParseSess, eval: &mut F)
+                         -> bool
+    where F: FnMut(&ast::MetaItem) -> bool
+{
     match cfg.node {
         ast::MetaItemKind::List(ref mis) => {
             for mi in mis.iter() {
@@ -594,10 +602,10 @@ pub fn cfg_matches(cfg: &ast::MetaItem, sess: &ParseSess, features: Option<&Feat
             // that they won't fail with the loop above.
             match &*cfg.name.as_str() {
                 "any" => mis.iter().any(|mi| {
-                    cfg_matches(mi.meta_item().unwrap(), sess, features)
+                    eval_condition(mi.meta_item().unwrap(), sess, eval)
                 }),
                 "all" => mis.iter().all(|mi| {
-                    cfg_matches(mi.meta_item().unwrap(), sess, features)
+                    eval_condition(mi.meta_item().unwrap(), sess, eval)
                 }),
                 "not" => {
                     if mis.len() != 1 {
@@ -605,7 +613,7 @@ pub fn cfg_matches(cfg: &ast::MetaItem, sess: &ParseSess, features: Option<&Feat
                         return false;
                     }
 
-                    !cfg_matches(mis[0].meta_item().unwrap(), sess, features)
+                    !eval_condition(mis[0].meta_item().unwrap(), sess, eval)
                 },
                 p => {
                     span_err!(sess.span_diagnostic, cfg.span, E0537, "invalid predicate `{}`", p);
@@ -614,20 +622,18 @@ pub fn cfg_matches(cfg: &ast::MetaItem, sess: &ParseSess, features: Option<&Feat
             }
         },
         ast::MetaItemKind::Word | ast::MetaItemKind::NameValue(..) => {
-            if let (Some(feats), Some(gated_cfg)) = (features, GatedCfg::gate(cfg)) {
-                gated_cfg.check_and_emit(sess, feats);
-            }
-            sess.config.contains(&(cfg.name(), cfg.value_str()))
+            eval(cfg)
         }
     }
 }
 
-/// Represents the #[stable], #[unstable] and #[rustc_deprecated] attributes.
+/// Represents the #[stable], #[unstable], #[rustc_{deprecated,const_unstable}] attributes.
 #[derive(RustcEncodable, RustcDecodable, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Stability {
     pub level: StabilityLevel,
     pub feature: Symbol,
     pub rustc_depr: Option<RustcDeprecation>,
+    pub rustc_const_unstable: Option<RustcConstUnstable>,
 }
 
 /// The available stability levels.
@@ -642,6 +648,11 @@ pub enum StabilityLevel {
 pub struct RustcDeprecation {
     pub since: Symbol,
     pub reason: Symbol,
+}
+
+#[derive(RustcEncodable, RustcDecodable, PartialEq, PartialOrd, Clone, Debug, Eq, Hash)]
+pub struct RustcConstUnstable {
+    pub feature: Symbol,
 }
 
 #[derive(RustcEncodable, RustcDecodable, PartialEq, PartialOrd, Clone, Debug, Eq, Hash)]
@@ -663,9 +674,15 @@ fn find_stability_generic<'a, I>(diagnostic: &Handler,
 {
     let mut stab: Option<Stability> = None;
     let mut rustc_depr: Option<RustcDeprecation> = None;
+    let mut rustc_const_unstable: Option<RustcConstUnstable> = None;
 
     'outer: for attr in attrs_iter {
-        if attr.path != "rustc_deprecated" && attr.path != "unstable" && attr.path != "stable" {
+        if ![
+            "rustc_deprecated",
+            "rustc_const_unstable",
+            "unstable",
+            "stable",
+        ].iter().any(|&s| attr.path == s) {
             continue // not a stability level
         }
 
@@ -688,21 +705,18 @@ fn find_stability_generic<'a, I>(diagnostic: &Handler,
                 }
             };
 
-            match &*meta.name.as_str() {
-                "rustc_deprecated" => {
-                    if rustc_depr.is_some() {
-                        span_err!(diagnostic, item_sp, E0540,
-                                  "multiple rustc_deprecated attributes");
-                        break
-                    }
-
-                    let mut since = None;
-                    let mut reason = None;
+            macro_rules! get_meta {
+                ($($name:ident),+) => {
+                    $(
+                        let mut $name = None;
+                    )+
                     for meta in metas {
                         if let Some(mi) = meta.meta_item() {
                             match &*mi.name().as_str() {
-                                "since" => if !get(mi, &mut since) { continue 'outer },
-                                "reason" => if !get(mi, &mut reason) { continue 'outer },
+                                $(
+                                    stringify!($name)
+                                        => if !get(mi, &mut $name) { continue 'outer },
+                                )+
                                 _ => {
                                     handle_errors(diagnostic, mi.span,
                                                   AttrError::UnknownMetaItem(mi.name()));
@@ -714,12 +728,24 @@ fn find_stability_generic<'a, I>(diagnostic: &Handler,
                             continue 'outer
                         }
                     }
+                }
+            }
+
+            match &*meta.name.as_str() {
+                "rustc_deprecated" => {
+                    if rustc_depr.is_some() {
+                        span_err!(diagnostic, item_sp, E0540,
+                                  "multiple rustc_deprecated attributes");
+                        continue 'outer
+                    }
+
+                    get_meta!(since, reason);
 
                     match (since, reason) {
                         (Some(since), Some(reason)) => {
                             rustc_depr = Some(RustcDeprecation {
-                                since: since,
-                                reason: reason,
+                                since,
+                                reason,
                             })
                         }
                         (None, _) => {
@@ -730,6 +756,23 @@ fn find_stability_generic<'a, I>(diagnostic: &Handler,
                             span_err!(diagnostic, attr.span(), E0543, "missing 'reason'");
                             continue
                         }
+                    }
+                }
+                "rustc_const_unstable" => {
+                    if rustc_const_unstable.is_some() {
+                        span_err!(diagnostic, item_sp, E0553,
+                                  "multiple rustc_const_unstable attributes");
+                        continue 'outer
+                    }
+
+                    get_meta!(feature);
+                    if let Some(feature) = feature {
+                        rustc_const_unstable = Some(RustcConstUnstable {
+                            feature
+                        });
+                    } else {
+                        span_err!(diagnostic, attr.span(), E0629, "missing 'feature'");
+                        continue
                     }
                 }
                 "unstable" => {
@@ -763,7 +806,7 @@ fn find_stability_generic<'a, I>(diagnostic: &Handler,
                         (Some(feature), reason, Some(issue)) => {
                             stab = Some(Stability {
                                 level: Unstable {
-                                    reason: reason,
+                                    reason,
                                     issue: {
                                         if let Ok(issue) = issue.as_str().parse() {
                                             issue
@@ -774,8 +817,9 @@ fn find_stability_generic<'a, I>(diagnostic: &Handler,
                                         }
                                     }
                                 },
-                                feature: feature,
+                                feature,
                                 rustc_depr: None,
+                                rustc_const_unstable: None,
                             })
                         }
                         (None, _, _) => {
@@ -817,10 +861,11 @@ fn find_stability_generic<'a, I>(diagnostic: &Handler,
                         (Some(feature), Some(since)) => {
                             stab = Some(Stability {
                                 level: Stable {
-                                    since: since,
+                                    since,
                                 },
-                                feature: feature,
+                                feature,
                                 rustc_depr: None,
+                                rustc_const_unstable: None,
                             })
                         }
                         (None, _) => {
@@ -848,6 +893,17 @@ fn find_stability_generic<'a, I>(diagnostic: &Handler,
         } else {
             span_err!(diagnostic, item_sp, E0549,
                       "rustc_deprecated attribute must be paired with \
+                       either stable or unstable attribute");
+        }
+    }
+
+    // Merge the const-unstable info into the stability info
+    if let Some(rustc_const_unstable) = rustc_const_unstable {
+        if let Some(ref mut stab) = stab {
+            stab.rustc_const_unstable = Some(rustc_const_unstable);
+        } else {
+            span_err!(diagnostic, item_sp, E0630,
+                      "rustc_const_unstable attribute must be paired with \
                        either stable or unstable attribute");
         }
     }
@@ -1055,7 +1111,7 @@ impl MetaItem {
     fn from_tokens<I>(tokens: &mut iter::Peekable<I>) -> Option<MetaItem>
         where I: Iterator<Item = TokenTree>,
     {
-        let (mut span, name) = match tokens.next() {
+        let (span, name) = match tokens.next() {
             Some(TokenTree::Token(span, Token::Ident(ident))) => (span, ident.name),
             Some(TokenTree::Token(_, Token::Interpolated(ref nt))) => match nt.0 {
                 token::Nonterminal::NtIdent(ident) => (ident.span, ident.node.name),
@@ -1064,26 +1120,21 @@ impl MetaItem {
             },
             _ => return None,
         };
+        let list_closing_paren_pos = tokens.peek().map(|tt| tt.span().hi());
         let node = match MetaItemKind::from_tokens(tokens) {
             Some(node) => node,
             _ => return None,
         };
-        if let Some(last_span) = node.last_span() {
-            span.hi = last_span.hi;
-        }
-        Some(MetaItem { name: name, span: span, node: node })
+        let hi = match node {
+            MetaItemKind::NameValue(ref lit) => lit.span.hi(),
+            MetaItemKind::List(..) => list_closing_paren_pos.unwrap_or(span.hi()),
+            _ => span.hi(),
+        };
+        Some(MetaItem { name, node, span: span.with_hi(hi) })
     }
 }
 
 impl MetaItemKind {
-    fn last_span(&self) -> Option<Span> {
-        match *self {
-            MetaItemKind::Word => None,
-            MetaItemKind::List(ref list) => list.last().map(NestedMetaItem::span),
-            MetaItemKind::NameValue(ref lit) => Some(lit.span),
-        }
-    }
-
     pub fn tokens(&self, span: Span) -> TokenStream {
         match *self {
             MetaItemKind::Word => TokenStream::empty(),
@@ -1130,7 +1181,7 @@ impl MetaItemKind {
         let mut result = Vec::new();
         while let Some(..) = tokens.peek() {
             match NestedMetaItemKind::from_tokens(&mut tokens) {
-                Some(item) => result.push(Spanned { span: item.span(), node: item }),
+                Some(item) => result.push(respan(item.span(), item)),
                 None => return None,
             }
             match tokens.next() {
@@ -1163,7 +1214,7 @@ impl NestedMetaItemKind {
         if let Some(TokenTree::Token(span, token)) = tokens.peek().cloned() {
             if let Some(node) = LitKind::from_token(token) {
                 tokens.next();
-                return Some(NestedMetaItemKind::Literal(Spanned { node: node, span: span }));
+                return Some(NestedMetaItemKind::Literal(respan(span, node)));
             }
         }
 
@@ -1256,7 +1307,7 @@ pub trait HasAttrs: Sized {
 impl<T: HasAttrs> HasAttrs for Spanned<T> {
     fn attrs(&self) -> &[ast::Attribute] { self.node.attrs() }
     fn map_attrs<F: FnOnce(Vec<ast::Attribute>) -> Vec<ast::Attribute>>(self, f: F) -> Self {
-        Spanned { node: self.node.map_attrs(f), span: self.span }
+        respan(self.span, self.node.map_attrs(f))
     }
 }
 

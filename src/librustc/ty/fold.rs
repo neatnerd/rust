@@ -39,6 +39,7 @@
 //! These methods return true to indicate that the visitor has found what it is looking for
 //! and does not need to visit anything else.
 
+use middle::const_val::ConstVal;
 use ty::{self, Binder, Ty, TyCtxt, TypeFlags};
 
 use std::fmt;
@@ -67,7 +68,7 @@ pub trait TypeFoldable<'tcx>: fmt::Debug + Clone {
     fn has_type_flags(&self, flags: TypeFlags) -> bool {
         self.visit_with(&mut HasTypeFlagsVisitor { flags: flags })
     }
-    fn has_projection_types(&self) -> bool {
+    fn has_projections(&self) -> bool {
         self.has_type_flags(TypeFlags::HAS_PROJECTION)
     }
     fn references_error(&self) -> bool {
@@ -139,6 +140,10 @@ pub trait TypeFolder<'gcx: 'tcx, 'tcx> : Sized {
     fn fold_region(&mut self, r: ty::Region<'tcx>) -> ty::Region<'tcx> {
         r.super_fold_with(self)
     }
+
+    fn fold_const(&mut self, c: &'tcx ty::Const<'tcx>) -> &'tcx ty::Const<'tcx> {
+        c.super_fold_with(self)
+    }
 }
 
 pub trait TypeVisitor<'tcx> : Sized {
@@ -152,6 +157,10 @@ pub trait TypeVisitor<'tcx> : Sized {
 
     fn visit_region(&mut self, r: ty::Region<'tcx>) -> bool {
         r.super_visit_with(self)
+    }
+
+    fn visit_const(&mut self, c: &'tcx ty::Const<'tcx>) -> bool {
+        c.super_visit_with(self)
     }
 }
 
@@ -436,67 +445,6 @@ impl<'a, 'gcx, 'tcx> TypeFolder<'gcx, 'tcx> for RegionReplacer<'a, 'gcx, 'tcx> {
 }
 
 ///////////////////////////////////////////////////////////////////////////
-// Region eraser
-
-impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
-    /// Returns an equivalent value with all free regions removed (note
-    /// that late-bound regions remain, because they are important for
-    /// subtyping, but they are anonymized and normalized as well)..
-    pub fn erase_regions<T>(self, value: &T) -> T
-        where T : TypeFoldable<'tcx>
-    {
-        let value1 = value.fold_with(&mut RegionEraser(self));
-        debug!("erase_regions({:?}) = {:?}",
-               value, value1);
-        return value1;
-
-        struct RegionEraser<'a, 'gcx: 'a+'tcx, 'tcx: 'a>(TyCtxt<'a, 'gcx, 'tcx>);
-
-        impl<'a, 'gcx, 'tcx> TypeFolder<'gcx, 'tcx> for RegionEraser<'a, 'gcx, 'tcx> {
-            fn tcx<'b>(&'b self) -> TyCtxt<'b, 'gcx, 'tcx> { self.0 }
-
-            fn fold_ty(&mut self, ty: Ty<'tcx>) -> Ty<'tcx> {
-                if let Some(u) = self.tcx().normalized_cache.borrow().get(&ty).cloned() {
-                    return u;
-                }
-
-                // FIXME(eddyb) should local contexts have a cache too?
-                if let Some(ty_lifted) = self.tcx().lift_to_global(&ty) {
-                    let tcx = self.tcx().global_tcx();
-                    let t_norm = ty_lifted.super_fold_with(&mut RegionEraser(tcx));
-                    tcx.normalized_cache.borrow_mut().insert(ty_lifted, t_norm);
-                    t_norm
-                } else {
-                    ty.super_fold_with(self)
-                }
-            }
-
-            fn fold_binder<T>(&mut self, t: &ty::Binder<T>) -> ty::Binder<T>
-                where T : TypeFoldable<'tcx>
-            {
-                let u = self.tcx().anonymize_late_bound_regions(t);
-                u.super_fold_with(self)
-            }
-
-            fn fold_region(&mut self, r: ty::Region<'tcx>) -> ty::Region<'tcx> {
-                // because late-bound regions affect subtyping, we can't
-                // erase the bound/free distinction, but we can replace
-                // all free regions with 'erased.
-                //
-                // Note that we *CAN* replace early-bound regions -- the
-                // type system never "sees" those, they get substituted
-                // away. In trans, they will always be erased to 'erased
-                // whenever a substitution occurs.
-                match *r {
-                    ty::ReLateBound(..) => r,
-                    _ => self.tcx().types.re_erased
-                }
-            }
-        }
-    }
-}
-
-///////////////////////////////////////////////////////////////////////////
 // Region shifter
 //
 // Shifts the De Bruijn indices on all escaping bound regions by a
@@ -602,6 +550,17 @@ impl<'tcx> TypeVisitor<'tcx> for HasTypeFlagsVisitor {
         let flags = r.type_flags();
         debug!("HasTypeFlagsVisitor: r={:?} r.flags={:?} self.flags={:?}", r, flags, self.flags);
         flags.intersects(self.flags)
+    }
+
+    fn visit_const(&mut self, c: &'tcx ty::Const<'tcx>) -> bool {
+        if let ConstVal::Unevaluated(..) = c.val {
+            let projection_flags = TypeFlags::HAS_NORMALIZABLE_PROJECTION |
+                TypeFlags::HAS_PROJECTION;
+            if projection_flags.intersects(self.flags) {
+                return true;
+            }
+        }
+        c.super_visit_with(self)
     }
 }
 

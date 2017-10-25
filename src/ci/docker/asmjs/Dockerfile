@@ -13,11 +13,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   gdb \
   xz-utils
 
-COPY scripts/dumb-init.sh /scripts/
-RUN sh /scripts/dumb-init.sh
-
 COPY scripts/emscripten.sh /scripts/
 RUN bash /scripts/emscripten.sh
+
+COPY scripts/sccache.sh /scripts/
+RUN sh /scripts/sccache.sh
 
 ENV PATH=$PATH:/emsdk-portable
 ENV PATH=$PATH:/emsdk-portable/clang/e1.37.13_64bit/
@@ -31,9 +31,4 @@ ENV TARGETS=asmjs-unknown-emscripten
 
 ENV RUST_CONFIGURE_ARGS --target=$TARGETS
 
-ENV SCRIPT python2.7 ../x.py test --target $TARGETS
-
-COPY scripts/sccache.sh /scripts/
-RUN sh /scripts/sccache.sh
-
-ENTRYPOINT ["/usr/bin/dumb-init", "--"]
+ENV SCRIPT python2.7 ../x.py test --target $TARGETS src/test/run-pass

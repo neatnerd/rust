@@ -273,7 +273,10 @@ impl str {
         core_str::StrExt::is_char_boundary(self, index)
     }
 
-    /// Converts a string slice to a byte slice.
+    /// Converts a string slice to a byte slice. To convert the byte slice back
+    /// into a string slice, use the [`str::from_utf8`] function.
+    ///
+    /// [`str::from_utf8`]: ./str/fn.from_utf8.html
     ///
     /// # Examples
     ///
@@ -289,7 +292,39 @@ impl str {
         core_str::StrExt::as_bytes(self)
     }
 
-    /// Converts a mutable string slice to a mutable byte slice.
+    /// Converts a mutable string slice to a mutable byte slice. To convert the
+    /// mutable byte slice back into a mutable string slice, use the
+    /// [`str::from_utf8_mut`] function.
+    ///
+    /// [`str::from_utf8_mut`]: ./str/fn.from_utf8_mut.html
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// let mut s = String::from("Hello");
+    /// let bytes = unsafe { s.as_bytes_mut() };
+    ///
+    /// assert_eq!(b"Hello", bytes);
+    /// ```
+    ///
+    /// Mutability:
+    ///
+    /// ```
+    /// let mut s = String::from("🗻∈🌏");
+    ///
+    /// unsafe {
+    ///     let bytes = s.as_bytes_mut();
+    ///
+    ///     bytes[0] = 0xF0;
+    ///     bytes[1] = 0x9F;
+    ///     bytes[2] = 0x8D;
+    ///     bytes[3] = 0x94;
+    /// }
+    ///
+    /// assert_eq!("🍔∈🌏", s);
+    /// ```
     #[stable(feature = "str_mut_extras", since = "1.20.0")]
     #[inline(always)]
     pub unsafe fn as_bytes_mut(&mut self) -> &mut [u8] {
@@ -328,11 +363,16 @@ impl str {
     /// # Examples
     ///
     /// ```
-    /// let v = "🗻∈🌏";
+    /// let mut v = String::from("🗻∈🌏");
+    ///
     /// assert_eq!(Some("🗻"), v.get(0..4));
-    /// assert!(v.get(1..).is_none());
-    /// assert!(v.get(..8).is_none());
-    /// assert!(v.get(..42).is_none());
+    ///
+    /// // indices not on UTF-8 sequence boundaries
+    /// assert!(v.get_mut(1..).is_none());
+    /// assert!(v.get_mut(..8).is_none());
+    ///
+    /// // out of bounds
+    /// assert!(v.get_mut(..42).is_none());
     /// ```
     #[stable(feature = "str_checked_slicing", since = "1.20.0")]
     #[inline]
@@ -350,11 +390,25 @@ impl str {
     /// # Examples
     ///
     /// ```
-    /// let mut v = String::from("🗻∈🌏");
-    /// assert_eq!(Some("🗻"), v.get_mut(0..4).map(|v| &*v));
-    /// assert!(v.get_mut(1..).is_none());
-    /// assert!(v.get_mut(..8).is_none());
+    /// use std::ascii::AsciiExt;
+    ///
+    /// let mut v = String::from("hello");
+    /// // correct length
+    /// assert!(v.get_mut(0..5).is_some());
+    /// // out of bounds
     /// assert!(v.get_mut(..42).is_none());
+    /// assert_eq!(Some("he"), v.get_mut(0..2).map(|v| &*v));
+    ///
+    /// assert_eq!("hello", v);
+    /// {
+    ///     let s = v.get_mut(0..2);
+    ///     let s = s.map(|s| {
+    ///         s.make_ascii_uppercase();
+    ///         &*s
+    ///     });
+    ///     assert_eq!(Some("HE"), s);
+    /// }
+    /// assert_eq!("HEllo", v);
     /// ```
     #[stable(feature = "str_checked_slicing", since = "1.20.0")]
     #[inline]
@@ -563,12 +617,16 @@ impl str {
     /// Basic usage:
     ///
     /// ```
+    /// use std::ascii::AsciiExt;
+    ///
     /// let mut s = "Per Martin-Löf".to_string();
-    ///
-    /// let (first, last) = s.split_at_mut(3);
-    ///
-    /// assert_eq!("Per", first);
-    /// assert_eq!(" Martin-Löf", last);
+    /// {
+    ///     let (first, last) = s.split_at_mut(3);
+    ///     first.make_ascii_uppercase();
+    ///     assert_eq!("PER", first);
+    ///     assert_eq!(" Martin-Löf", last);
+    /// }
+    /// assert_eq!("PER Martin-Löf", s);
     /// ```
     #[inline]
     #[stable(feature = "str_split_at", since = "1.4.0")]
@@ -797,6 +855,19 @@ impl str {
     }
 
     /// Returns an iterator of `u16` over the string encoded as UTF-16.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// let text = "Zażółć gęślą jaźń";
+    ///
+    /// let utf8_len = text.len();
+    /// let utf16_len = text.encode_utf16().count();
+    ///
+    /// assert!(utf16_len <= utf8_len);
+    /// ```
     #[stable(feature = "encode_utf16", since = "1.8.0")]
     pub fn encode_utf16(&self) -> EncodeUtf16 {
         EncodeUtf16 { encoder: Utf16Encoder::new(self[..].chars()) }
@@ -888,13 +959,15 @@ impl str {
     /// assert_eq!(s.find("Léopard"), Some(13));
     /// ```
     ///
-    /// More complex patterns with closures:
+    /// More complex patterns using point-free style and closures:
     ///
     /// ```
     /// let s = "Löwe 老虎 Léopard";
     ///
     /// assert_eq!(s.find(char::is_whitespace), Some(5));
     /// assert_eq!(s.find(char::is_lowercase), Some(1));
+    /// assert_eq!(s.find(|c: char| c.is_whitespace() || c.is_lowercase()), Some(1));
+    /// assert_eq!(s.find(|c: char| (c < 'o') && (c > 'a')), Some(4));
     /// ```
     ///
     /// Not finding the pattern:
@@ -1693,7 +1766,7 @@ impl str {
     ///
     /// [`Err`]: str/trait.FromStr.html#associatedtype.Err
     ///
-    /// # Example
+    /// # Examples
     ///
     /// Basic usage
     ///
@@ -1725,6 +1798,17 @@ impl str {
     }
 
     /// Converts a `Box<str>` into a `Box<[u8]>` without copying or allocating.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// let s = "this is a string";
+    /// let boxed_str = s.to_owned().into_boxed_str();
+    /// let boxed_bytes = boxed_str.into_boxed_bytes();
+    /// assert_eq!(*boxed_bytes, *s.as_bytes());
+    /// ```
     #[stable(feature = "str_box_extras", since = "1.20.0")]
     pub fn into_boxed_bytes(self: Box<str>) -> Box<[u8]> {
         self.into()
@@ -1965,10 +2049,8 @@ impl str {
     /// ```
     #[stable(feature = "box_str", since = "1.4.0")]
     pub fn into_string(self: Box<str>) -> String {
-        unsafe {
-            let slice = mem::transmute::<Box<str>, Box<[u8]>>(self);
-            String::from_utf8_unchecked(slice.into_vec())
-        }
+        let slice = Box::<[u8]>::from(self);
+        unsafe { String::from_utf8_unchecked(slice.into_vec()) }
     }
 
     /// Create a [`String`] by repeating a string `n` times.
@@ -1992,7 +2074,18 @@ impl str {
 
 /// Converts a boxed slice of bytes to a boxed string slice without checking
 /// that the string contains valid UTF-8.
+///
+/// # Examples
+///
+/// Basic usage:
+///
+/// ```
+/// let smile_utf8 = Box::new([226, 152, 186]);
+/// let smile = unsafe { std::str::from_boxed_utf8_unchecked(smile_utf8) };
+///
+/// assert_eq!("☺", &*smile);
+/// ```
 #[stable(feature = "str_box_extras", since = "1.20.0")]
 pub unsafe fn from_boxed_utf8_unchecked(v: Box<[u8]>) -> Box<str> {
-    mem::transmute(v)
+    Box::from_raw(Box::into_raw(v) as *mut str)
 }

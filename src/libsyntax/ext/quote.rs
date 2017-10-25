@@ -383,7 +383,7 @@ pub fn unflatten(tts: Vec<TokenTree>) -> Vec<TokenTree> {
             }
             TokenTree::Token(span, token::CloseDelim(delim)) => {
                 let tree = TokenTree::Delimited(span, Delimited {
-                    delim: delim,
+                    delim,
                     tts: result.into_iter().map(TokenStream::from).collect::<TokenStream>().into(),
                 });
                 result = results.pop().unwrap();
@@ -686,7 +686,9 @@ fn expr_mk_token(cx: &ExtCtxt, sp: Span, tok: &token::Token) -> P<ast::Expr> {
         token::At           => "At",
         token::Dot          => "Dot",
         token::DotDot       => "DotDot",
+        token::DotEq        => "DotEq",
         token::DotDotDot    => "DotDotDot",
+        token::DotDotEq     => "DotDotEq",
         token::Comma        => "Comma",
         token::Semi         => "Semi",
         token::Colon        => "Colon",

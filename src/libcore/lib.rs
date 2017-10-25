@@ -51,9 +51,7 @@
 // Since libcore defines many fundamental lang items, all tests live in a
 // separate crate, libcoretest, to avoid bizarre issues.
 
-#![crate_name = "core"]
 #![stable(feature = "core", since = "1.6.0")]
-#![crate_type = "rlib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
        html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
        html_root_url = "https://doc.rust-lang.org/nightly/",
@@ -87,11 +85,29 @@
 #![feature(prelude_import)]
 #![feature(repr_simd, platform_intrinsics)]
 #![feature(rustc_attrs)]
+#![cfg_attr(not(stage0), feature(rustc_const_unstable))]
 #![feature(specialization)]
 #![feature(staged_api)]
 #![feature(unboxed_closures)]
 #![feature(untagged_unions)]
 #![feature(unwind_attributes)]
+
+#![cfg_attr(not(stage0), feature(const_min_value))]
+#![cfg_attr(not(stage0), feature(const_max_value))]
+#![cfg_attr(not(stage0), feature(const_atomic_bool_new))]
+#![cfg_attr(not(stage0), feature(const_atomic_isize_new))]
+#![cfg_attr(not(stage0), feature(const_atomic_usize_new))]
+#![cfg_attr(not(stage0), feature(const_atomic_i8_new))]
+#![cfg_attr(not(stage0), feature(const_atomic_u8_new))]
+#![cfg_attr(not(stage0), feature(const_atomic_i16_new))]
+#![cfg_attr(not(stage0), feature(const_atomic_u16_new))]
+#![cfg_attr(not(stage0), feature(const_atomic_i32_new))]
+#![cfg_attr(not(stage0), feature(const_atomic_u32_new))]
+#![cfg_attr(not(stage0), feature(const_atomic_i64_new))]
+#![cfg_attr(not(stage0), feature(const_atomic_u64_new))]
+#![cfg_attr(not(stage0), feature(const_unsafe_cell_new))]
+#![cfg_attr(not(stage0), feature(const_cell_new))]
+#![cfg_attr(not(stage0), feature(const_nonzero_new))]
 
 #[prelude_import]
 #[allow(unused)]

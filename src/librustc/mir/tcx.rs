@@ -70,7 +70,9 @@ impl<'a, 'gcx, 'tcx> LvalueTy<'tcx> {
                 LvalueTy::Ty {
                     ty: match ty.sty {
                         ty::TyArray(inner, size) => {
-                            tcx.mk_array(inner, size-(from as usize)-(to as usize))
+                            let size = size.val.to_const_int().unwrap().to_u64().unwrap();
+                            let len = size - (from as u64) - (to as u64);
+                            tcx.mk_array(inner, len)
                         }
                         ty::TySlice(..) => ty,
                         _ => {
@@ -135,17 +137,19 @@ impl<'tcx> Lvalue<'tcx> {
     }
 }
 
+pub enum RvalueInitializationState {
+    Shallow,
+    Deep
+}
+
 impl<'tcx> Rvalue<'tcx> {
     pub fn ty<'a, 'gcx, D>(&self, local_decls: &D, tcx: TyCtxt<'a, 'gcx, 'tcx>) -> Ty<'tcx>
         where D: HasLocalDecls<'tcx>
     {
         match *self {
             Rvalue::Use(ref operand) => operand.ty(local_decls, tcx),
-            Rvalue::Repeat(ref operand, ref count) => {
-                let op_ty = operand.ty(local_decls, tcx);
-                let count = count.as_u64(tcx.sess.target.uint_type);
-                assert_eq!(count as usize as u64, count);
-                tcx.mk_array(op_ty, count as usize)
+            Rvalue::Repeat(ref operand, count) => {
+                tcx.mk_array_const_usize(operand.ty(local_decls, tcx), count)
             }
             Rvalue::Ref(reg, bk, ref lv) => {
                 let lv_ty = lv.ty(local_decls, tcx).to_ty(tcx);
@@ -188,7 +192,7 @@ impl<'tcx> Rvalue<'tcx> {
             Rvalue::Aggregate(ref ak, ref ops) => {
                 match **ak {
                     AggregateKind::Array(ty) => {
-                        tcx.mk_array(ty, ops.len())
+                        tcx.mk_array(ty, ops.len() as u64)
                     }
                     AggregateKind::Tuple => {
                         tcx.mk_tup(
@@ -202,8 +206,21 @@ impl<'tcx> Rvalue<'tcx> {
                     AggregateKind::Closure(did, substs) => {
                         tcx.mk_closure_from_closure_substs(did, substs)
                     }
+                    AggregateKind::Generator(did, substs, interior) => {
+                        tcx.mk_generator(did, substs, interior)
+                    }
                 }
             }
+        }
+    }
+
+    #[inline]
+    /// Returns whether this rvalue is deeply initialized (most rvalues) or
+    /// whether its only shallowly initialized (`Rvalue::Box`).
+    pub fn initialization_state(&self) -> RvalueInitializationState {
+        match *self {
+            Rvalue::NullaryOp(NullOp::Box, _) => RvalueInitializationState::Shallow,
+            _ => RvalueInitializationState::Deep
         }
     }
 }

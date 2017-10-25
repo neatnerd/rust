@@ -33,10 +33,9 @@ macro_rules! t {
 
 macro_rules! tidy_error {
     ($bad:expr, $fmt:expr, $($arg:tt)*) => ({
-        use std::io::Write;
         *$bad = true;
-        write!(::std::io::stderr(), "tidy error: ").expect("could not write to stderr");
-        writeln!(::std::io::stderr(), $fmt, $($arg)*).expect("could not write to stderr");
+        eprint!("tidy error: ");
+        eprintln!($fmt, $($arg)*);
     });
 }
 
@@ -62,7 +61,10 @@ fn filter_dirs(path: &Path) -> bool {
         "src/rt/hoedown",
         "src/tools/cargo",
         "src/tools/rls",
+        "src/tools/clippy",
         "src/tools/rust-installer",
+        "src/tools/rustfmt",
+        "src/tools/miri",
     ];
     skip.iter().any(|p| path.ends_with(p))
 }

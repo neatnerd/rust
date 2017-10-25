@@ -13,9 +13,6 @@
 #![allow(non_snake_case)]
 #![allow(dead_code)]
 
-#![crate_name = "rustc_llvm"]
-#![crate_type = "dylib"]
-#![crate_type = "rlib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
        html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
        html_root_url = "https://doc.rust-lang.org/nightly/")]
@@ -27,10 +24,13 @@
 #![feature(link_args)]
 #![feature(static_nobundle)]
 
-extern crate libc;
+// See librustc_cratesio_shim/Cargo.toml for a comment explaining this.
+#[allow(unused_extern_crates)]
+extern crate rustc_cratesio_shim;
+
 #[macro_use]
-#[no_link]
-extern crate rustc_bitflags;
+extern crate bitflags;
+extern crate libc;
 
 pub use self::IntPredicate::*;
 pub use self::RealPredicate::*;
@@ -38,9 +38,7 @@ pub use self::TypeKind::*;
 pub use self::AtomicRmwBinOp::*;
 pub use self::MetadataType::*;
 pub use self::CodeGenOptSize::*;
-pub use self::DiagnosticKind::*;
 pub use self::CallConv::*;
-pub use self::DiagnosticSeverity::*;
 pub use self::Linkage::*;
 
 use std::str::FromStr;
@@ -51,7 +49,7 @@ use libc::{c_uint, c_char, size_t};
 
 pub mod archive_ro;
 pub mod diagnostic;
-pub mod ffi;
+mod ffi;
 
 pub use ffi::*;
 
@@ -120,7 +118,7 @@ impl FromStr for ArchiveKind {
 
 #[allow(missing_copy_implementations)]
 pub enum RustString_opaque {}
-pub type RustStringRef = *mut RustString_opaque;
+type RustStringRef = *mut RustString_opaque;
 type RustStringRepr = *mut RefCell<Vec<u8>>;
 
 /// Appending to a Rust string -- used by RawRustStringOstream.
@@ -199,8 +197,8 @@ impl Attribute {
 
 // Memory-managed interface to target data.
 
-pub struct TargetData {
-    pub lltd: TargetDataRef,
+struct TargetData {
+    lltd: TargetDataRef,
 }
 
 impl Drop for TargetData {
@@ -211,7 +209,7 @@ impl Drop for TargetData {
     }
 }
 
-pub fn mk_target_data(string_rep: &str) -> TargetData {
+fn mk_target_data(string_rep: &str) -> TargetData {
     let string_rep = CString::new(string_rep).unwrap();
     TargetData { lltd: unsafe { LLVMCreateTargetData(string_rep.as_ptr()) } }
 }
@@ -272,7 +270,7 @@ pub fn get_param(llfn: ValueRef, index: c_uint) -> ValueRef {
     }
 }
 
-pub fn get_params(llfn: ValueRef) -> Vec<ValueRef> {
+fn get_params(llfn: ValueRef) -> Vec<ValueRef> {
     unsafe {
         let num_params = LLVMCountParams(llfn);
         let mut params = Vec::with_capacity(num_params as usize);
@@ -348,10 +346,6 @@ pub fn initialize_available_targets() {
                  LLVMInitializePowerPCTargetMC,
                  LLVMInitializePowerPCAsmPrinter,
                  LLVMInitializePowerPCAsmParser);
-    init_target!(llvm_component = "pnacl",
-                 LLVMInitializePNaClTargetInfo,
-                 LLVMInitializePNaClTarget,
-                 LLVMInitializePNaClTargetMC);
     init_target!(llvm_component = "systemz",
                  LLVMInitializeSystemZTargetInfo,
                  LLVMInitializeSystemZTarget,

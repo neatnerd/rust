@@ -94,14 +94,14 @@ impl Command {
         let program = os2c(program, &mut saw_nul);
         Command {
             argv: vec![program.as_ptr(), ptr::null()],
-            program: program,
+            program,
             args: Vec::new(),
             env: None,
             envp: None,
             cwd: None,
             uid: None,
             gid: None,
-            saw_nul: saw_nul,
+            saw_nul,
             closures: Vec::new(),
             stdin: None,
             stdout: None,
@@ -464,7 +464,6 @@ mod tests {
     // test from being flaky we ignore it on macOS.
     #[test]
     #[cfg_attr(target_os = "macos", ignore)]
-    #[cfg_attr(target_os = "nacl", ignore)] // no signals on NaCl.
     // When run under our current QEMU emulation test suite this test fails,
     // although the reason isn't very clear as to why. For now this test is
     // ignored there.

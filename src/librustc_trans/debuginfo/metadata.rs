@@ -30,7 +30,7 @@ use rustc::ty::fold::TypeVisitor;
 use rustc::ty::subst::Substs;
 use rustc::ty::util::TypeIdHasher;
 use rustc::hir;
-use rustc_data_structures::ToHex;
+use rustc::ich::Fingerprint;
 use {type_of, machine, monomorphize};
 use common::{self, CrateContext};
 use type_::Type;
@@ -146,11 +146,10 @@ impl<'tcx> TypeMap<'tcx> {
 
         // The hasher we are using to generate the UniqueTypeId. We want
         // something that provides more than the 64 bits of the DefaultHasher.
-
-        let mut type_id_hasher = TypeIdHasher::<[u8; 20]>::new(cx.tcx());
+        let mut type_id_hasher = TypeIdHasher::<Fingerprint>::new(cx.tcx());
         type_id_hasher.visit_ty(type_);
-
         let unique_type_id = type_id_hasher.finish().to_hex();
+
         let key = self.unique_id_interner.intern(&unique_type_id);
         self.type_to_unique_id.insert(type_, UniqueTypeId(key));
 
@@ -205,11 +204,11 @@ fn create_and_register_recursive_type_forward_declaration<'a, 'tcx>(
     type_map.register_type_with_metadata(unfinished_type, metadata_stub);
 
     UnfinishedMetadata {
-        unfinished_type: unfinished_type,
-        unique_type_id: unique_type_id,
-        metadata_stub: metadata_stub,
-        llvm_type: llvm_type,
-        member_description_factory: member_description_factory,
+        unfinished_type,
+        unique_type_id,
+        metadata_stub,
+        llvm_type,
+        member_description_factory,
     }
 }
 
@@ -366,7 +365,7 @@ fn vec_slice_metadata<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
                                          -> bool {
         member_llvm_types.len() == 2 &&
         member_llvm_types[0] == type_of::type_of(cx, element_type).ptr_to() &&
-        member_llvm_types[1] == cx.int_type()
+        member_llvm_types[1] == cx.isize_ty()
     }
 }
 
@@ -530,7 +529,8 @@ pub fn type_metadata<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
             MetadataCreationResult::new(basic_type_metadata(cx, t), false)
         }
         ty::TyArray(typ, len) => {
-            fixed_vec_metadata(cx, unique_type_id, typ, Some(len as u64), usage_site_span)
+            let len = len.val.to_const_int().unwrap().to_u64().unwrap();
+            fixed_vec_metadata(cx, unique_type_id, typ, Some(len), usage_site_span)
         }
         ty::TySlice(typ) => {
             fixed_vec_metadata(cx, unique_type_id, typ, None, usage_site_span)
@@ -574,6 +574,16 @@ pub fn type_metadata<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
         }
         ty::TyClosure(def_id, substs) => {
             let upvar_tys : Vec<_> = substs.upvar_tys(def_id, cx.tcx()).collect();
+            prepare_tuple_metadata(cx,
+                                   t,
+                                   &upvar_tys,
+                                   unique_type_id,
+                                   usage_site_span).finalize(cx)
+        }
+        ty::TyGenerator(def_id, substs, _) => {
+            let upvar_tys : Vec<_> = substs.field_tys(def_id, cx.tcx()).map(|t| {
+                cx.tcx().fully_normalize_associated_types_in(&t)
+            }).collect();
             prepare_tuple_metadata(cx,
                                    t,
                                    &upvar_tys,
@@ -811,9 +821,9 @@ pub fn compile_unit_metadata(scc: &SharedCrateContext,
 
             let gcov_cu_info = [
                 path_to_mdstring(debug_context.llcontext,
-                                 &scc.output_filenames().with_extension("gcno")),
+                                 &scc.tcx().output_filenames(LOCAL_CRATE).with_extension("gcno")),
                 path_to_mdstring(debug_context.llcontext,
-                                 &scc.output_filenames().with_extension("gcda")),
+                                 &scc.tcx().output_filenames(LOCAL_CRATE).with_extension("gcda")),
                 cu_desc_metadata,
             ];
             let gcov_metadata = llvm::LLVMMDNodeInContext(debug_context.llcontext,
@@ -847,8 +857,8 @@ struct MetadataCreationResult {
 impl MetadataCreationResult {
     fn new(metadata: DIType, already_stored_in_typemap: bool) -> MetadataCreationResult {
         MetadataCreationResult {
-            metadata: metadata,
-            already_stored_in_typemap: already_stored_in_typemap
+            metadata,
+            already_stored_in_typemap,
         }
     }
 }
@@ -947,10 +957,10 @@ impl<'tcx> StructMemberDescriptionFactory<'tcx> {
             let offset = FixedMemberOffset { bytes: offsets[i].bytes() as usize};
 
             MemberDescription {
-                name: name,
+                name,
                 llvm_type: type_of::in_memory_type_of(cx, fty),
                 type_metadata: type_metadata(cx, fty, self.span),
-                offset: offset,
+                offset,
                 flags: DIFlags::FlagZero,
             }
         }).collect()
@@ -987,9 +997,9 @@ fn prepare_struct_metadata<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
         struct_llvm_type,
         StructMDF(StructMemberDescriptionFactory {
             ty: struct_type,
-            variant: variant,
-            substs: substs,
-            span: span,
+            variant,
+            substs,
+            span,
         })
     )
 }
@@ -1052,7 +1062,7 @@ fn prepare_tuple_metadata<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
         TupleMDF(TupleMemberDescriptionFactory {
             ty: tuple_type,
             component_types: component_types.to_vec(),
-            span: span,
+            span,
         })
     )
 }
@@ -1111,9 +1121,9 @@ fn prepare_union_metadata<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
         union_metadata_stub,
         union_llvm_type,
         UnionMDF(UnionMemberDescriptionFactory {
-            variant: variant,
-            substs: substs,
-            span: span,
+            variant,
+            substs,
+            span,
         })
     )
 }
@@ -1462,14 +1472,14 @@ fn describe_enum_variant<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
     let member_description_factory =
         VariantMDF(VariantMemberDescriptionFactory {
             offsets: &struct_def.offsets[..],
-            args: args,
+            args,
             discriminant_type_metadata: match discriminant_info {
                 RegularDiscriminant(discriminant_type_metadata) => {
                     Some(discriminant_type_metadata)
                 }
                 _ => None
             },
-            span: span,
+            span,
         });
 
     (metadata_stub, variant_llvm_type, member_description_factory)
@@ -1590,19 +1600,19 @@ fn prepare_enum_metadata<'a, 'tcx>(cx: &CrateContext<'a, 'tcx>,
         enum_metadata,
         enum_llvm_type,
         EnumMDF(EnumMemberDescriptionFactory {
-            enum_type: enum_type,
+            enum_type,
             type_rep: type_rep.layout,
-            discriminant_type_metadata: discriminant_type_metadata,
-            containing_scope: containing_scope,
-            file_metadata: file_metadata,
-            span: span,
+            discriminant_type_metadata,
+            containing_scope,
+            file_metadata,
+            span,
         }),
     );
 
     fn get_enum_discriminant_name(cx: &CrateContext,
                                   def_id: DefId)
                                   -> InternedString {
-        cx.tcx().item_name(def_id).as_str()
+        cx.tcx().item_name(def_id)
     }
 }
 
@@ -1792,7 +1802,7 @@ pub fn create_global_var_metadata(cx: &CrateContext,
     };
 
     let is_local_to_unit = is_node_local_to_unit(cx, node_id);
-    let variable_type = common::def_ty(cx.shared(), node_def_id, Substs::empty());
+    let variable_type = common::def_ty(cx.tcx(), node_def_id, Substs::empty());
     let type_metadata = type_metadata(cx, variable_type, span);
     let var_name = tcx.item_name(node_def_id).to_string();
     let linkage_name = mangled_name_of_item(cx, node_def_id, "");

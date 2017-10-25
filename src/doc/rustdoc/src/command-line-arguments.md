@@ -96,11 +96,11 @@ Using this flag looks like this:
 $ rustdoc src/lib.rs --crate-name mycrate
 ```
 
-By default, `rustodc` assumes that the name of your crate is the same name
+By default, `rustdoc` assumes that the name of your crate is the same name
 as the `.rs` file. `--crate-name` lets you override this assumption with
 whatever name you choose.
 
-## `-L`/`--library-path`: 
+## `-L`/`--library-path`: where to look for dependencies
 
 Using this flag looks like this:
 
@@ -141,20 +141,6 @@ Similar to `--library-path`, `--extern` is about specifying the location
 of a dependency. `--library-path` provides directories to search in, `--extern`
 instead lets you specify exactly which dependency is located where.
 
-
-## `--plugin-path`: loading plugins
-
-Using this flag looks like this:
-
-```bash
-$ rustdoc src/lib.rs --plugin-path=/path/to/plugins
-```
-
-Similar to `--library-path`, but for plugins. For more, see
-the [chapter on plugins](plugins.html).
-
-See also: `--plugins`.
-
 ## `--passes`: add more rustdoc passes
 
 Using this flag looks like this:
@@ -170,18 +156,6 @@ arguments will be the name of which passes to run in addition to the defaults.
 For more details on passes, see [the chapter on them](passes.html).
 
 See also `--no-defaults`.
-
-## `--plugins`: 
-
-Using this flag looks like this:
-
-```bash
-$ rustdoc src/lib.rs --plugins foo bar
-```
-
-For more, see the [chapter on plugins](plugins.html).
-
-See also: `--plugin-path`.
 
 ## `--no-defaults`: don't run default passes
 
@@ -212,7 +186,7 @@ on documentation tests](documentation-tests.html).
 
 See also `--test-args`.
 
-## `--test-args`: 
+## `--test-args`: pass options to test runner
 
 Using this flag looks like this:
 
@@ -225,7 +199,7 @@ For more, see [the chapter on documentation tests](documentation-tests.html).
 
 See also `--test`.
 
-## `--target`: 
+## `--target`: generate documentation for the specified target triple
 
 Using this flag looks like this:
 
@@ -279,7 +253,7 @@ $ rustdoc README.md --html-before-content extra.html
 ```
 
 This flag takes a list of files, and inserts them inside the `<body>` tag but
-before the other content `rustodc` would normally produce in the rendered
+before the other content `rustdoc` would normally produce in the rendered
 documentation.
 
 ## `--html-after-content`: include more HTML after the content
@@ -292,7 +266,7 @@ $ rustdoc README.md --html-after-content extra.html
 ```
 
 This flag takes a list of files, and inserts them before the `</body>` tag but
-after the other content `rustodc` would normally produce in the rendered
+after the other content `rustdoc` would normally produce in the rendered
 documentation.
 
 

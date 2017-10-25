@@ -27,7 +27,6 @@ use std::hash::Hash;
 use syntax::ast;
 use syntax::ext::hygiene::Mark;
 use syntax::symbol::{Symbol, InternedString};
-use ty::TyCtxt;
 use util::nodemap::NodeMap;
 
 /// The DefPathTable maps DefIndexes to DefKeys and vice versa.
@@ -80,8 +79,10 @@ impl DefPathTable {
 
     #[inline(always)]
     pub fn def_path_hash(&self, index: DefIndex) -> DefPathHash {
-        self.def_path_hashes[index.address_space().index()]
-                            [index.as_array_index()]
+        let ret = self.def_path_hashes[index.address_space().index()]
+                                      [index.as_array_index()];
+        debug!("def_path_hash({:?}) = {:?}", index, ret);
+        return ret
     }
 
     pub fn add_def_path_hashes_to(&self,
@@ -210,10 +211,9 @@ impl DefKey {
             DefPathData::TypeParam(name) |
             DefPathData::LifetimeDef(name) |
             DefPathData::EnumVariant(name) |
-            DefPathData::Binding(name) |
             DefPathData::Field(name) |
             DefPathData::GlobalMetaData(name) => {
-                (*name.as_str()).hash(&mut hasher);
+                name.hash(&mut hasher);
             }
 
             DefPathData::Impl |
@@ -295,26 +295,6 @@ impl DefPath {
         DefPath { data: data, krate: krate }
     }
 
-    pub fn to_string(&self, tcx: TyCtxt) -> String {
-        let mut s = String::with_capacity(self.data.len() * 16);
-
-        s.push_str(&tcx.original_crate_name(self.krate).as_str());
-        s.push_str("/");
-        // Don't print the whole crate disambiguator. That's just annoying in
-        // debug output.
-        s.push_str(&tcx.crate_disambiguator(self.krate).as_str()[..7]);
-
-        for component in &self.data {
-            write!(s,
-                   "::{}[{}]",
-                   component.data.as_interned_str(),
-                   component.disambiguator)
-                .unwrap();
-        }
-
-        s
-    }
-
     /// Returns a string representation of the DefPath without
     /// the crate-prefix. This method is useful if you don't have
     /// a TyCtxt available.
@@ -347,31 +327,29 @@ pub enum DefPathData {
     /// An impl
     Impl,
     /// Something in the type NS
-    TypeNs(Symbol),
+    TypeNs(InternedString),
     /// Something in the value NS
-    ValueNs(Symbol),
+    ValueNs(InternedString),
     /// A module declaration
-    Module(Symbol),
+    Module(InternedString),
     /// A macro rule
-    MacroDef(Symbol),
+    MacroDef(InternedString),
     /// A closure expression
     ClosureExpr,
 
     // Subportions of items
     /// A type parameter (generic parameter)
-    TypeParam(Symbol),
+    TypeParam(InternedString),
     /// A lifetime definition
-    LifetimeDef(Symbol),
+    LifetimeDef(InternedString),
     /// A variant of a enum
-    EnumVariant(Symbol),
+    EnumVariant(InternedString),
     /// A struct field
-    Field(Symbol),
+    Field(InternedString),
     /// Implicit ctor for a tuple-like struct
     StructCtor,
     /// Initializer for a const
     Initializer,
-    /// Pattern binding
-    Binding(Symbol),
     /// An `impl Trait` type node.
     ImplTrait,
     /// A `typeof` type node.
@@ -380,7 +358,7 @@ pub enum DefPathData {
     /// GlobalMetaData identifies a piece of crate metadata that is global to
     /// a whole crate (as opposed to just one item). GlobalMetaData components
     /// are only supposed to show up right below the crate root.
-    GlobalMetaData(Symbol)
+    GlobalMetaData(InternedString)
 }
 
 #[derive(Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Debug,
@@ -434,18 +412,22 @@ impl Definitions {
         DefPath::make(LOCAL_CRATE, index, |p| self.def_key(p))
     }
 
+    #[inline]
     pub fn opt_def_index(&self, node: ast::NodeId) -> Option<DefIndex> {
         self.node_to_def_index.get(&node).cloned()
     }
 
+    #[inline]
     pub fn opt_local_def_id(&self, node: ast::NodeId) -> Option<DefId> {
         self.opt_def_index(node).map(DefId::local)
     }
 
+    #[inline]
     pub fn local_def_id(&self, node: ast::NodeId) -> DefId {
         self.opt_local_def_id(node).unwrap()
     }
 
+    #[inline]
     pub fn as_local_node_id(&self, def_id: DefId) -> Option<ast::NodeId> {
         if def_id.krate == LOCAL_CRATE {
             let space_index = def_id.index.address_space().index();
@@ -461,7 +443,24 @@ impl Definitions {
         }
     }
 
+    #[inline]
     pub fn node_to_hir_id(&self, node_id: ast::NodeId) -> hir::HirId {
+        self.node_to_hir_id[node_id]
+    }
+
+    pub fn find_node_for_hir_id(&self, hir_id: hir::HirId) -> ast::NodeId {
+        self.node_to_hir_id
+            .iter()
+            .position(|x| *x == hir_id)
+            .map(|idx| ast::NodeId::new(idx))
+            .unwrap()
+    }
+
+    #[inline]
+    pub fn def_index_to_hir_id(&self, def_index: DefIndex) -> hir::HirId {
+        let space_index = def_index.address_space().index();
+        let array_index = def_index.as_array_index();
+        let node_id = self.def_index_to_node[space_index][array_index];
         self.node_to_hir_id[node_id]
     }
 
@@ -580,7 +579,7 @@ impl Definitions {
 }
 
 impl DefPathData {
-    pub fn get_opt_name(&self) -> Option<Symbol> {
+    pub fn get_opt_name(&self) -> Option<InternedString> {
         use self::DefPathData::*;
         match *self {
             TypeNs(name) |
@@ -590,7 +589,6 @@ impl DefPathData {
             TypeParam(name) |
             LifetimeDef(name) |
             EnumVariant(name) |
-            Binding(name) |
             Field(name) |
             GlobalMetaData(name) => Some(name),
 
@@ -615,10 +613,9 @@ impl DefPathData {
             TypeParam(name) |
             LifetimeDef(name) |
             EnumVariant(name) |
-            Binding(name) |
             Field(name) |
             GlobalMetaData(name) => {
-                return name.as_str();
+                return name
             }
 
             // note that this does not show up in user printouts
@@ -663,7 +660,7 @@ macro_rules! define_global_metadata_kind {
                     definitions.create_def_with_parent(
                         CRATE_DEF_INDEX,
                         ast::DUMMY_NODE_ID,
-                        DefPathData::GlobalMetaData(instance.name()),
+                        DefPathData::GlobalMetaData(instance.name().as_str()),
                         GLOBAL_MD_ADDRESS_SPACE,
                         Mark::root()
                     );
@@ -677,7 +674,7 @@ macro_rules! define_global_metadata_kind {
                 let def_key = DefKey {
                     parent: Some(CRATE_DEF_INDEX),
                     disambiguated_data: DisambiguatedDefPathData {
-                        data: DefPathData::GlobalMetaData(self.name()),
+                        data: DefPathData::GlobalMetaData(self.name().as_str()),
                         disambiguator: 0,
                     }
                 };

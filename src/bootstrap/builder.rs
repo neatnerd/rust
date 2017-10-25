@@ -8,15 +8,16 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use std::fmt::Debug;
-use std::hash::Hash;
+use std::any::Any;
 use std::cell::RefCell;
+use std::collections::BTreeSet;
+use std::env;
+use std::fmt::Debug;
+use std::fs;
+use std::hash::Hash;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::fs;
-use std::ops::Deref;
-use std::any::Any;
-use std::collections::BTreeSet;
 
 use compile;
 use install;
@@ -120,28 +121,19 @@ impl StepDescription {
     fn maybe_run(&self, builder: &Builder, path: Option<&Path>) {
         let build = builder.build;
         let hosts = if self.only_build_targets || self.only_build {
-            &build.config.host[..1]
+            build.build_triple()
         } else {
             &build.hosts
         };
 
-        // Determine the actual targets participating in this rule.
-        // NOTE: We should keep the full projection from build triple to
-        // the hosts for the dist steps, now that the hosts array above is
-        // truncated to avoid duplication of work in that case. Therefore
-        // the original non-shadowed hosts array is used below.
+        // Determine the targets participating in this rule.
         let targets = if self.only_hosts {
-            // If --target was specified but --host wasn't specified,
-            // don't run any host-only tests. Also, respect any `--host`
-            // overrides as done for `hosts`.
-            if build.flags.host.len() > 0 {
-                &build.flags.host[..]
-            } else if build.flags.target.len() > 0 {
+            if build.config.run_host_only {
                 &[]
             } else if self.only_build {
-                &build.config.host[..1]
+                build.build_triple()
             } else {
-                &build.config.host[..]
+                &build.hosts
             }
         } else {
             &build.targets
@@ -202,7 +194,7 @@ pub struct ShouldRun<'a> {
 impl<'a> ShouldRun<'a> {
     fn new(builder: &'a Builder) -> ShouldRun<'a> {
         ShouldRun {
-            builder: builder,
+            builder,
             paths: BTreeSet::new(),
             is_really_default: true, // by default no additional conditions
         }
@@ -257,19 +249,19 @@ impl<'a> Builder<'a> {
                 compile::StartupObjects, tool::BuildManifest, tool::Rustbook, tool::ErrorIndex,
                 tool::UnstableBookGen, tool::Tidy, tool::Linkchecker, tool::CargoTest,
                 tool::Compiletest, tool::RemoteTestServer, tool::RemoteTestClient,
-                tool::RustInstaller, tool::Cargo, tool::Rls, tool::Rustdoc,
-                native::Llvm),
+                tool::RustInstaller, tool::Cargo, tool::Rls, tool::Rustdoc, tool::Clippy,
+                native::Llvm, tool::Rustfmt, tool::Miri),
             Kind::Test => describe!(check::Tidy, check::Bootstrap, check::DefaultCompiletest,
-                check::HostCompiletest, check::Crate, check::CrateLibrustc, check::Linkcheck,
-                check::Cargotest, check::Cargo, check::Rls, check::Docs, check::ErrorIndex,
-                check::Distcheck),
+                check::HostCompiletest, check::Crate, check::CrateLibrustc, check::Rustdoc,
+                check::Linkcheck, check::Cargotest, check::Cargo, check::Rls, check::Docs,
+                check::ErrorIndex, check::Distcheck, check::Rustfmt, check::Miri, check::Clippy),
             Kind::Bench => describe!(check::Crate, check::CrateLibrustc),
             Kind::Doc => describe!(doc::UnstableBook, doc::UnstableBookGen, doc::TheBook,
                 doc::Standalone, doc::Std, doc::Test, doc::Rustc, doc::ErrorIndex, doc::Nomicon,
-                doc::Reference),
+                doc::Reference, doc::Rustdoc, doc::CargoBook),
             Kind::Dist => describe!(dist::Docs, dist::Mingw, dist::Rustc, dist::DebuggerScripts,
                 dist::Std, dist::Analysis, dist::Src, dist::PlainSourceTarball, dist::Cargo,
-                dist::Rls, dist::Extended, dist::HashSign),
+                dist::Rls, dist::Extended, dist::HashSign, dist::DontDistWithMiriEnabled),
             Kind::Install => describe!(install::Docs, install::Std, install::Cargo, install::Rls,
                 install::Analysis, install::Src, install::Rustc),
         }
@@ -287,9 +279,9 @@ impl<'a> Builder<'a> {
         };
 
         let builder = Builder {
-            build: build,
-            top_stage: build.flags.stage.unwrap_or(2),
-            kind: kind,
+            build,
+            top_stage: build.config.stage.unwrap_or(2),
+            kind,
             cache: Cache::new(),
             stack: RefCell::new(Vec::new()),
         };
@@ -307,20 +299,20 @@ impl<'a> Builder<'a> {
     }
 
     pub fn run(build: &Build) {
-        let (kind, paths) = match build.flags.cmd {
+        let (kind, paths) = match build.config.cmd {
             Subcommand::Build { ref paths } => (Kind::Build, &paths[..]),
             Subcommand::Doc { ref paths } => (Kind::Doc, &paths[..]),
             Subcommand::Test { ref paths, .. } => (Kind::Test, &paths[..]),
             Subcommand::Bench { ref paths, .. } => (Kind::Bench, &paths[..]),
             Subcommand::Dist { ref paths } => (Kind::Dist, &paths[..]),
             Subcommand::Install { ref paths } => (Kind::Install, &paths[..]),
-            Subcommand::Clean => panic!(),
+            Subcommand::Clean { .. } => panic!(),
         };
 
         let builder = Builder {
-            build: build,
-            top_stage: build.flags.stage.unwrap_or(2),
-            kind: kind,
+            build,
+            top_stage: build.config.stage.unwrap_or(2),
+            kind,
             cache: Cache::new(),
             stack: RefCell::new(Vec::new()),
         };
@@ -333,7 +325,7 @@ impl<'a> Builder<'a> {
         StepDescription::run(&Builder::get_step_descriptions(Kind::Doc), self, paths);
     }
 
-    /// Obtain a compiler at a given stage and for a given host. Explictly does
+    /// Obtain a compiler at a given stage and for a given host. Explicitly does
     /// not take `Compiler` since all `Compiler` instances are meant to be
     /// obtained through this function, since it ensures that they are valid
     /// (i.e., built and assembled).
@@ -414,22 +406,22 @@ impl<'a> Builder<'a> {
         }
     }
 
-    pub fn rustdoc(&self, compiler: Compiler) -> PathBuf {
-        self.ensure(tool::Rustdoc { target_compiler: compiler })
+    pub fn rustdoc(&self, host: Interned<String>) -> PathBuf {
+        self.ensure(tool::Rustdoc { host })
     }
 
-    pub fn rustdoc_cmd(&self, compiler: Compiler) -> Command {
+    pub fn rustdoc_cmd(&self, host: Interned<String>) -> Command {
         let mut cmd = Command::new(&self.out.join("bootstrap/debug/rustdoc"));
-        cmd
-            .env("RUSTC_STAGE", compiler.stage.to_string())
-            .env("RUSTC_SYSROOT", if compiler.is_snapshot(&self.build) {
-                INTERNER.intern_path(self.build.rustc_snapshot_libdir())
-            } else {
-                self.sysroot(compiler)
-            })
-            .env("RUSTC_LIBDIR", self.sysroot_libdir(compiler, self.build.build))
-            .env("CFG_RELEASE_CHANNEL", &self.build.config.channel)
-            .env("RUSTDOC_REAL", self.rustdoc(compiler));
+        let compiler = self.compiler(self.top_stage, host);
+        cmd.env("RUSTC_STAGE", compiler.stage.to_string())
+           .env("RUSTC_SYSROOT", self.sysroot(compiler))
+           .env("RUSTC_LIBDIR", self.sysroot_libdir(compiler, self.build.build))
+           .env("CFG_RELEASE_CHANNEL", &self.build.config.channel)
+           .env("RUSTDOC_REAL", self.rustdoc(host))
+           .env("RUSTDOC_CRATE_VERSION", self.build.rust_version());
+        if let Some(linker) = self.build.linker(host) {
+            cmd.env("RUSTC_TARGET_LINKER", linker);
+        }
         cmd
     }
 
@@ -449,8 +441,13 @@ impl<'a> Builder<'a> {
         let out_dir = self.stage_out(compiler, mode);
         cargo.env("CARGO_TARGET_DIR", out_dir)
              .arg(cmd)
-             .arg("-j").arg(self.jobs().to_string())
              .arg("--target").arg(target);
+
+        // If we were invoked from `make` then that's already got a jobserver
+        // set up for us so no need to tell Cargo about jobs all over again.
+        if env::var_os("MAKEFLAGS").is_none() && env::var_os("MFLAGS").is_none() {
+             cargo.arg("-j").arg(self.jobs().to_string());
+        }
 
         // FIXME: Temporary fix for https://github.com/rust-lang/cargo/issues/3005
         // Force cargo to output binaries with disambiguating hashes in the name
@@ -474,8 +471,6 @@ impl<'a> Builder<'a> {
              .env("RUSTC", self.out.join("bootstrap/debug/rustc"))
              .env("RUSTC_REAL", self.rustc(compiler))
              .env("RUSTC_STAGE", stage.to_string())
-             .env("RUSTC_CODEGEN_UNITS",
-                  self.config.rust_codegen_units.to_string())
              .env("RUSTC_DEBUG_ASSERTIONS",
                   self.config.rust_debug_assertions.to_string())
              .env("RUSTC_SYSROOT", self.sysroot(compiler))
@@ -483,11 +478,22 @@ impl<'a> Builder<'a> {
              .env("RUSTC_RPATH", self.config.rust_rpath.to_string())
              .env("RUSTDOC", self.out.join("bootstrap/debug/rustdoc"))
              .env("RUSTDOC_REAL", if cmd == "doc" || cmd == "test" {
-                 self.rustdoc(compiler)
+                 self.rustdoc(compiler.host)
              } else {
                  PathBuf::from("/path/to/nowhere/rustdoc/not/required")
              })
-             .env("RUSTC_FLAGS", self.rustc_flags(target).join(" "));
+             .env("TEST_MIRI", self.config.test_miri.to_string());
+
+        if let Some(n) = self.config.rust_codegen_units {
+            cargo.env("RUSTC_CODEGEN_UNITS", n.to_string());
+        }
+
+        if let Some(host_linker) = self.build.linker(compiler.host) {
+            cargo.env("RUSTC_HOST_LINKER", host_linker);
+        }
+        if let Some(target_linker) = self.build.linker(target) {
+            cargo.env("RUSTC_TARGET_LINKER", target_linker);
+        }
 
         if mode != Mode::Tool {
             // Tools don't get debuginfo right now, e.g. cargo and rls don't
@@ -501,7 +507,7 @@ impl<'a> Builder<'a> {
             // crates). Let's say, for example that rustc itself depends on the
             // bitflags crate. If an external crate then depends on the
             // bitflags crate as well, we need to make sure they don't
-            // conflict, even if they pick the same verison of bitflags. We'll
+            // conflict, even if they pick the same version of bitflags. We'll
             // want to make sure that e.g. a plugin and rustc each get their
             // own copy of bitflags.
 
@@ -513,6 +519,10 @@ impl<'a> Builder<'a> {
             // wrapper around the actual rustc will detect -C metadata being
             // passed and frob it with this extra string we're passing in.
             cargo.env("RUSTC_METADATA_SUFFIX", "rustc");
+        }
+
+        if let Some(x) = self.crt_static(target) {
+            cargo.env("RUSTC_CRT_STATIC", x.to_string());
         }
 
         // Enable usage of unstable features
@@ -532,7 +542,10 @@ impl<'a> Builder<'a> {
         // For other crates, however, we know that we've already got a standard
         // library up and running, so we can use the normal compiler to compile
         // build scripts in that situation.
-        if mode == Mode::Libstd {
+        //
+        // If LLVM support is disabled we need to use the snapshot compiler to compile
+        // build scripts, as the new compiler doesnt support executables.
+        if mode == Mode::Libstd || !self.build.config.llvm_enabled {
             cargo.env("RUSTC_SNAPSHOT", &self.initial_rustc)
                  .env("RUSTC_SNAPSHOT_LIBDIR", self.rustc_snapshot_libdir());
         } else {
@@ -543,34 +556,55 @@ impl<'a> Builder<'a> {
         // Ignore incremental modes except for stage0, since we're
         // not guaranteeing correctness across builds if the compiler
         // is changing under your feet.`
-        if self.flags.incremental && compiler.stage == 0 {
+        if self.config.incremental && compiler.stage == 0 {
             let incr_dir = self.incremental_dir(compiler);
             cargo.env("RUSTC_INCREMENTAL", incr_dir);
         }
 
-        if let Some(ref on_fail) = self.flags.on_fail {
+        if let Some(ref on_fail) = self.config.on_fail {
             cargo.env("RUSTC_ON_FAIL", on_fail);
         }
 
         cargo.env("RUSTC_VERBOSE", format!("{}", self.verbosity));
 
-        // Specify some various options for build scripts used throughout
-        // the build.
+        // Throughout the build Cargo can execute a number of build scripts
+        // compiling C/C++ code and we need to pass compilers, archivers, flags, etc
+        // obtained previously to those build scripts.
+        // Build scripts use either the `cc` crate or `configure/make` so we pass
+        // the options through environment variables that are fetched and understood by both.
         //
         // FIXME: the guard against msvc shouldn't need to be here
         if !target.contains("msvc") {
-            cargo.env(format!("CC_{}", target), self.cc(target))
-                 .env(format!("AR_{}", target), self.ar(target).unwrap()) // only msvc is None
-                 .env(format!("CFLAGS_{}", target), self.cflags(target).join(" "));
+            let cc = self.cc(target);
+            cargo.env(format!("CC_{}", target), cc)
+                 .env("CC", cc);
+
+            let cflags = self.cflags(target).join(" ");
+            cargo.env(format!("CFLAGS_{}", target), cflags.clone())
+                 .env("CFLAGS", cflags.clone());
+
+            if let Some(ar) = self.ar(target) {
+                let ranlib = format!("{} s", ar.display());
+                cargo.env(format!("AR_{}", target), ar)
+                     .env("AR", ar)
+                     .env(format!("RANLIB_{}", target), ranlib.clone())
+                     .env("RANLIB", ranlib);
+            }
 
             if let Ok(cxx) = self.cxx(target) {
-                 cargo.env(format!("CXX_{}", target), cxx);
+                cargo.env(format!("CXX_{}", target), cxx)
+                     .env("CXX", cxx)
+                     .env(format!("CXXFLAGS_{}", target), cflags.clone())
+                     .env("CXXFLAGS", cflags);
             }
         }
 
         if mode == Mode::Libstd && self.config.extended && compiler.is_final_stage(self) {
             cargo.env("RUSTC_SAVE_ANALYSIS", "api".to_string());
         }
+
+        // For `cargo doc` invocations, make rustdoc print the Rust version into the docs
+        cargo.env("RUSTDOC_CRATE_VERSION", self.build.rust_version());
 
         // Environment variables *required* throughout the build
         //
@@ -580,12 +614,20 @@ impl<'a> Builder<'a> {
         // Set this for all builds to make sure doc builds also get it.
         cargo.env("CFG_RELEASE_CHANNEL", &self.build.config.channel);
 
-        if self.is_verbose() {
+        if self.is_very_verbose() {
             cargo.arg("-v");
         }
         // FIXME: cargo bench does not accept `--release`
         if self.config.rust_optimize && cmd != "bench" {
             cargo.arg("--release");
+
+            if mode != Mode::Libstd &&
+               self.config.rust_codegen_units.is_none() &&
+               self.build.is_rust_llvm(compiler.host)
+
+            {
+                cargo.env("RUSTC_THINLTO", "1");
+            }
         }
         if self.config.locked_deps {
             cargo.arg("--locked");

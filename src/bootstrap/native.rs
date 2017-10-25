@@ -11,7 +11,7 @@
 //! Compilation of native dependencies like LLVM.
 //!
 //! Native projects like LLVM unfortunately aren't suited just yet for
-//! compilation in build scripts that Cargo has. This is because thie
+//! compilation in build scripts that Cargo has. This is because the
 //! compilation takes a *very* long time but also because we don't want to
 //! compile LLVM 3 times as part of a normal bootstrap (we want it cached).
 //!
@@ -27,7 +27,7 @@ use std::process::Command;
 
 use build_helper::output;
 use cmake;
-use gcc;
+use cc;
 
 use Build;
 use util;
@@ -56,6 +56,12 @@ impl Step for Llvm {
     fn run(self, builder: &Builder) {
         let build = builder.build;
         let target = self.target;
+
+        // If we're not compiling for LLVM bail out here.
+        if !build.config.llvm_enabled {
+            return;
+        }
+
         // If we're using a custom LLVM bail out here, but we can only use a
         // custom LLVM for the build triple.
         if let Some(config) = build.config.target_config.get(&target) {
@@ -128,6 +134,15 @@ impl Step for Llvm {
            .define("LLVM_PARALLEL_COMPILE_JOBS", build.jobs().to_string())
            .define("LLVM_TARGET_ARCH", target.split('-').next().unwrap())
            .define("LLVM_DEFAULT_TARGET_TRIPLE", target);
+
+
+        // This setting makes the LLVM tools link to the dynamic LLVM library,
+        // which saves both memory during parallel links and overall disk space
+        // for the tools.  We don't distribute any of those tools, so this is
+        // just a local concern.  However, it doesn't work well everywhere.
+        if target.contains("linux-gnu") || target.contains("apple-darwin") {
+           cfg.define("LLVM_LINK_LLVM_DYLIB", "ON");
+        }
 
         if target.contains("msvc") {
             cfg.define("LLVM_USE_CRT_DEBUG", "MT");
@@ -212,6 +227,13 @@ impl Step for Llvm {
             cfg.build_arg("-j").build_arg(build.jobs().to_string());
             cfg.define("CMAKE_C_FLAGS", build.cflags(target).join(" "));
             cfg.define("CMAKE_CXX_FLAGS", build.cflags(target).join(" "));
+            if let Some(ar) = build.ar(target) {
+                if ar.is_absolute() {
+                    // LLVM build breaks if `CMAKE_AR` is a relative path, for some reason it
+                    // tries to resolve this path in the LLVM build directory.
+                    cfg.define("CMAKE_AR", sanitize_cc(ar));
+                }
+            }
         };
 
         configure_compilers(&mut cfg);
@@ -237,11 +259,14 @@ fn check_llvm_version(build: &Build, llvm_config: &Path) {
 
     let mut cmd = Command::new(llvm_config);
     let version = output(cmd.arg("--version"));
-    if version.starts_with("3.5") || version.starts_with("3.6") ||
-       version.starts_with("3.7") {
-        return
+    let mut parts = version.split('.').take(2)
+        .filter_map(|s| s.parse::<u32>().ok());
+    if let (Some(major), Some(minor)) = (parts.next(), parts.next()) {
+        if major > 3 || (major == 3 && minor >= 9) {
+            return
+        }
     }
-    panic!("\n\nbad LLVM version: {}, need >=3.5\n\n", version)
+    panic!("\n\nbad LLVM version: {}, need >=3.9\n\n", version)
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -274,7 +299,7 @@ impl Step for TestHelpers {
         let _folder = build.fold_output(|| "build_test_helpers");
         println!("Building test helpers");
         t!(fs::create_dir_all(&dst));
-        let mut cfg = gcc::Config::new();
+        let mut cfg = cc::Build::new();
 
         // We may have found various cross-compilers a little differently due to our
         // extra configuration, so inform gcc of these compilers. Note, though, that
@@ -291,6 +316,7 @@ impl Step for TestHelpers {
            .target(&target)
            .host(&build.build)
            .opt_level(0)
+           .warnings(false)
            .debug(false)
            .file(build.src.join("src/rt/rust_test_helpers.c"))
            .compile("librust_test_helpers.a");
@@ -334,36 +360,53 @@ impl Step for Openssl {
         if !tarball.exists() {
             let tmp = tarball.with_extension("tmp");
             // originally from https://www.openssl.org/source/...
-            let url = format!("https://s3.amazonaws.com/rust-lang-ci/rust-ci-mirror/{}",
+            let url = format!("https://s3-us-west-1.amazonaws.com/rust-lang-ci2/rust-ci-mirror/{}",
                               name);
-            let mut ok = false;
+            let mut last_error = None;
             for _ in 0..3 {
                 let status = Command::new("curl")
                                 .arg("-o").arg(&tmp)
+                                .arg("-f")  // make curl fail if the URL does not return HTTP 200
                                 .arg(&url)
                                 .status()
                                 .expect("failed to spawn curl");
-                if status.success() {
-                    ok = true;
-                    break
+
+                // Retry if download failed.
+                if !status.success() {
+                    last_error = Some(status.to_string());
+                    continue;
                 }
+
+                // Ensure the hash is correct.
+                let mut shasum = if target.contains("apple") || build.build.contains("netbsd") {
+                    let mut cmd = Command::new("shasum");
+                    cmd.arg("-a").arg("256");
+                    cmd
+                } else {
+                    Command::new("sha256sum")
+                };
+                let output = output(&mut shasum.arg(&tmp));
+                let found = output.split_whitespace().next().unwrap();
+
+                // If the hash is wrong, probably the download is incomplete or S3 served an error
+                // page. In any case, retry.
+                if found != OPENSSL_SHA256 {
+                    last_error = Some(format!(
+                        "downloaded openssl sha256 different\n\
+                         expected: {}\n\
+                         found:    {}\n",
+                        OPENSSL_SHA256,
+                        found
+                    ));
+                    continue;
+                }
+
+                // Everything is fine, so exit the retry loop.
+                last_error = None;
+                break;
             }
-            if !ok {
-                panic!("failed to download openssl source")
-            }
-            let mut shasum = if target.contains("apple") {
-                let mut cmd = Command::new("shasum");
-                cmd.arg("-a").arg("256");
-                cmd
-            } else {
-                Command::new("sha256sum")
-            };
-            let output = output(&mut shasum.arg(&tmp));
-            let found = output.split_whitespace().next().unwrap();
-            if found != OPENSSL_SHA256 {
-                panic!("downloaded openssl sha256 different\n\
-                        expected: {}\n\
-                        found:    {}\n", OPENSSL_SHA256, found);
+            if let Some(error) = last_error {
+                panic!("failed to download openssl source: {}", error);
             }
             t!(fs::rename(&tmp, &tarball));
         }
@@ -371,9 +414,10 @@ impl Step for Openssl {
         let dst = build.openssl_install_dir(target).unwrap();
         drop(fs::remove_dir_all(&obj));
         drop(fs::remove_dir_all(&dst));
-        build.run(Command::new("tar").arg("xf").arg(&tarball).current_dir(&out));
+        build.run(Command::new("tar").arg("zxf").arg(&tarball).current_dir(&out));
 
-        let mut configure = Command::new(obj.join("Configure"));
+        let mut configure = Command::new("perl");
+        configure.arg(obj.join("Configure"));
         configure.arg(format!("--prefix={}", dst.display()));
         configure.arg("no-dso");
         configure.arg("no-ssl2");
@@ -382,6 +426,7 @@ impl Step for Openssl {
         let os = match &*target {
             "aarch64-linux-android" => "linux-aarch64",
             "aarch64-unknown-linux-gnu" => "linux-aarch64",
+            "aarch64-unknown-linux-musl" => "linux-aarch64",
             "arm-linux-androideabi" => "android",
             "arm-unknown-linux-gnueabi" => "linux-armv4",
             "arm-unknown-linux-gnueabihf" => "linux-armv4",
@@ -392,6 +437,7 @@ impl Step for Openssl {
             "i686-unknown-freebsd" => "BSD-x86-elf",
             "i686-unknown-linux-gnu" => "linux-elf",
             "i686-unknown-linux-musl" => "linux-elf",
+            "i686-unknown-netbsd" => "BSD-x86-elf",
             "mips-unknown-linux-gnu" => "linux-mips32",
             "mips64-unknown-linux-gnuabi64" => "linux64-mips64",
             "mips64el-unknown-linux-gnuabi64" => "linux64-mips64",
@@ -400,6 +446,7 @@ impl Step for Openssl {
             "powerpc64-unknown-linux-gnu" => "linux-ppc64",
             "powerpc64le-unknown-linux-gnu" => "linux-ppc64le",
             "s390x-unknown-linux-gnu" => "linux64-s390x",
+            "sparc64-unknown-netbsd" => "BSD-sparc64",
             "x86_64-apple-darwin" => "darwin64-x86_64-cc",
             "x86_64-linux-android" => "linux-x86_64",
             "x86_64-unknown-freebsd" => "BSD-x86_64",
@@ -418,6 +465,15 @@ impl Step for Openssl {
         if target == "aarch64-linux-android" || target == "x86_64-linux-android" {
             configure.arg("-mandroid");
             configure.arg("-fomit-frame-pointer");
+        }
+        if target == "sparc64-unknown-netbsd" {
+            // Need -m64 to get assembly generated correctly for sparc64.
+            configure.arg("-m64");
+            if build.build.contains("netbsd") {
+                // Disable sparc64 asm on NetBSD builders, it uses
+                // m4(1)'s -B flag, which NetBSD m4 does not support.
+                configure.arg("no-asm");
+            }
         }
         // Make PIE binaries
         // Non-PIE linker support was removed in Lollipop

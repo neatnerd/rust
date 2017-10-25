@@ -19,9 +19,6 @@
 //!
 //! This API is completely unstable and subject to change.
 
-#![crate_name = "rustc_lint"]
-#![crate_type = "dylib"]
-#![crate_type = "rlib"]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
       html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
       html_root_url = "https://doc.rust-lang.org/nightly/")]
@@ -41,14 +38,13 @@ extern crate syntax;
 extern crate rustc;
 #[macro_use]
 extern crate log;
-extern crate rustc_back;
 extern crate rustc_const_eval;
 extern crate syntax_pos;
 
-pub use rustc::lint;
-pub use rustc::middle;
-pub use rustc::session;
-pub use rustc::util;
+use rustc::lint;
+use rustc::middle;
+use rustc::session;
+use rustc::util;
 
 use session::Session;
 use lint::LintId;
@@ -131,9 +127,7 @@ pub fn register_builtins(store: &mut lint::LintStore, sess: Option<&Session>) {
                  NonSnakeCase,
                  NonUpperCaseGlobals,
                  NonShorthandFieldPatterns,
-                 UnusedUnsafe,
                  UnsafeCode,
-                 UnusedMut,
                  UnusedAllocation,
                  MissingCopyImplementations,
                  UnstableFeatures,

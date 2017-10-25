@@ -13,7 +13,7 @@ use syntax::ast;
 use syntax_pos::Span;
 
 use rustc::ty::{self, TyCtxt};
-use rustc::mir::{self, Mir};
+use rustc::mir::{self, Mir, Location};
 use rustc::mir::transform::{MirPass, MirSource};
 use rustc_data_structures::indexed_set::IdxSetBuf;
 use rustc_data_structures::indexed_vec::Idx;
@@ -45,7 +45,7 @@ impl MirPass for SanityCheck {
 
         let attributes = tcx.get_attrs(def_id);
         let param_env = tcx.param_env(def_id);
-        let move_data = MoveData::gather_moves(mir, tcx, param_env);
+        let move_data = MoveData::gather_moves(mir, tcx, param_env).unwrap();
         let mdpe = MoveDataParamEnv { move_data: move_data, param_env: param_env };
         let dead_unwinds = IdxSetBuf::new_empty(mir.basic_blocks().len());
         let flow_inits =
@@ -161,6 +161,7 @@ fn each_block<'a, 'tcx, O>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
             mir::StatementKind::StorageDead(_) |
             mir::StatementKind::InlineAsm { .. } |
             mir::StatementKind::EndRegion(_) |
+            mir::StatementKind::Validate(..) |
             mir::StatementKind::Nop => continue,
             mir::StatementKind::SetDiscriminant{ .. } =>
                 span_bug!(stmt.source_info.span,
@@ -201,7 +202,7 @@ fn each_block<'a, 'tcx, O>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         // reset GEN and KILL sets before emulating their effect.
         for e in sets.gen_set.words_mut() { *e = 0; }
         for e in sets.kill_set.words_mut() { *e = 0; }
-        results.0.operator.statement_effect(&mut sets, bb, j);
+        results.0.operator.statement_effect(&mut sets, Location { block: bb, statement_index: j });
         sets.on_entry.union(sets.gen_set);
         sets.on_entry.subtract(sets.kill_set);
     }

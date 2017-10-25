@@ -14,7 +14,10 @@ use isolated_encoder::IsolatedEncoder;
 use schema::*;
 
 use rustc::hir;
-use rustc::ty;
+use rustc::ty::{self, TyCtxt};
+
+use rustc::ich::Fingerprint;
+use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 
 #[derive(RustcEncodable, RustcDecodable)]
 pub struct Ast<'tcx> {
@@ -22,21 +25,39 @@ pub struct Ast<'tcx> {
     pub tables: Lazy<ty::TypeckTables<'tcx>>,
     pub nested_bodies: LazySeq<hir::Body>,
     pub rvalue_promotable_to_static: bool,
+    pub stable_bodies_hash: Fingerprint,
 }
 
 impl_stable_hash_for!(struct Ast<'tcx> {
     body,
     tables,
     nested_bodies,
-    rvalue_promotable_to_static
+    rvalue_promotable_to_static,
+    stable_bodies_hash
 });
 
 impl<'a, 'b, 'tcx> IsolatedEncoder<'a, 'b, 'tcx> {
     pub fn encode_body(&mut self, body_id: hir::BodyId) -> Lazy<Ast<'tcx>> {
         let body = self.tcx.hir.body(body_id);
-        let lazy_body = self.lazy(body);
 
-        let tables = self.tcx.body_tables(body_id);
+        // In order to avoid having to hash hir::Bodies from extern crates, we
+        // hash them here, during export, and store the hash with metadata.
+        let stable_bodies_hash = {
+            let mut hcx = self.tcx.create_stable_hashing_context();
+            let mut hasher = StableHasher::new();
+
+            hcx.while_hashing_hir_bodies(true, |hcx| {
+                hcx.while_hashing_spans(false, |hcx| {
+                    body.hash_stable(hcx, &mut hasher);
+                });
+            });
+
+            hasher.finish()
+        };
+
+        let lazy_body = self.lazy(body);
+        let body_owner_def_id = self.tcx.hir.body_owner_def_id(body_id);
+        let tables = self.tcx.typeck_tables_of(body_owner_def_id);
         let lazy_tables = self.lazy(tables);
 
         let mut visitor = NestedBodyCollector {
@@ -47,19 +68,20 @@ impl<'a, 'b, 'tcx> IsolatedEncoder<'a, 'b, 'tcx> {
         let lazy_nested_bodies = self.lazy_seq_ref_from_slice(&visitor.bodies_found);
 
         let rvalue_promotable_to_static =
-            self.tcx.rvalue_promotable_to_static.borrow()[&body.value.id];
+            self.tcx.const_is_rvalue_promotable_to_static(body_owner_def_id);
 
         self.lazy(&Ast {
             body: lazy_body,
             tables: lazy_tables,
             nested_bodies: lazy_nested_bodies,
-            rvalue_promotable_to_static: rvalue_promotable_to_static
+            rvalue_promotable_to_static,
+            stable_bodies_hash,
         })
     }
 }
 
 struct NestedBodyCollector<'a, 'tcx: 'a> {
-    tcx: ty::TyCtxt<'a, 'tcx, 'tcx>,
+    tcx: TyCtxt<'a, 'tcx, 'tcx>,
     bodies_found: Vec<&'tcx hir::Body>,
 }
 

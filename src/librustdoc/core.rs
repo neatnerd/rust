@@ -10,7 +10,7 @@
 
 use rustc_lint;
 use rustc_driver::{driver, target_features, abort_on_err};
-use rustc::dep_graph::DepGraph;
+use rustc_driver::pretty::ReplaceBodyWithLoop;
 use rustc::session::{self, config};
 use rustc::hir::def_id::DefId;
 use rustc::hir::def::Def;
@@ -24,8 +24,9 @@ use rustc_trans::back::link;
 use rustc_resolve as resolve;
 use rustc_metadata::cstore::CStore;
 
-use syntax::{ast, codemap};
+use syntax::codemap;
 use syntax::feature_gate::UnstableFeatures;
+use syntax::fold::Folder;
 use errors;
 use errors::emitter::ColorConfig;
 
@@ -64,7 +65,7 @@ pub struct DocContext<'a, 'tcx: 'a> {
     /// Table type parameter definition -> substituted type
     pub ty_substs: RefCell<FxHashMap<Def, clean::Type>>,
     /// Table node id of lifetime parameter definition -> substituted lifetime
-    pub lt_substs: RefCell<FxHashMap<ast::NodeId, clean::Lifetime>>,
+    pub lt_substs: RefCell<FxHashMap<DefId, clean::Lifetime>>,
 }
 
 impl<'a, 'tcx> DocContext<'a, 'tcx> {
@@ -76,7 +77,7 @@ impl<'a, 'tcx> DocContext<'a, 'tcx> {
     /// the substitutions for a type alias' RHS.
     pub fn enter_alias<F, R>(&self,
                              ty_substs: FxHashMap<Def, clean::Type>,
-                             lt_substs: FxHashMap<ast::NodeId, clean::Lifetime>,
+                             lt_substs: FxHashMap<DefId, clean::Lifetime>,
                              f: F) -> R
     where F: FnOnce() -> R {
         let (old_tys, old_lts) =
@@ -119,18 +120,18 @@ pub fn run_core(search_paths: SearchPaths,
     let warning_lint = lint::builtin::WARNINGS.name_lower();
 
     let sessopts = config::Options {
-        maybe_sysroot: maybe_sysroot,
-        search_paths: search_paths,
+        maybe_sysroot,
+        search_paths,
         crate_types: vec![config::CrateTypeRlib],
         lint_opts: if !allow_warnings { vec![(warning_lint, lint::Allow)] } else { vec![] },
         lint_cap: Some(lint::Allow),
-        externs: externs,
+        externs,
         target_triple: triple.unwrap_or(config::host_triple().to_string()),
         // Ensure that rustdoc works even if rustc is feature-staged
         unstable_features: UnstableFeatures::Allow,
         actually_rustdoc: true,
         debugging_opts: config::DebuggingOptions {
-            force_unstable_if_unmarked: force_unstable_if_unmarked,
+            force_unstable_if_unmarked,
             ..config::basic_debugging_options()
         },
         ..config::basic_options().clone()
@@ -142,11 +143,9 @@ pub fn run_core(search_paths: SearchPaths,
                                                                false,
                                                                Some(codemap.clone()));
 
-    let dep_graph = DepGraph::new(false);
-    let _ignore = dep_graph.in_ignore();
-    let cstore = Rc::new(CStore::new(&dep_graph, box rustc_trans::LlvmMetadataLoader));
+    let cstore = Rc::new(CStore::new(box rustc_trans::LlvmMetadataLoader));
     let mut sess = session::build_session_(
-        sessopts, &dep_graph, cpath, diagnostic_handler, codemap, cstore.clone()
+        sessopts, cpath, diagnostic_handler, codemap,
     );
     rustc_trans::init(&sess);
     rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
@@ -155,7 +154,10 @@ pub fn run_core(search_paths: SearchPaths,
     target_features::add_configuration(&mut cfg, &sess);
     sess.parse_sess.config = cfg;
 
-    let krate = panictry!(driver::phase_1_parse_input(&sess, &input));
+    let krate = panictry!(driver::phase_1_parse_input(&driver::CompileController::basic(),
+                                                      &sess,
+                                                      &input));
+    let krate = ReplaceBodyWithLoop::new().fold_crate(krate);
 
     let name = link::find_crate_name(Some(&sess), &krate.attrs, &input);
 
@@ -173,15 +175,22 @@ pub fn run_core(search_paths: SearchPaths,
 
     let arena = DroplessArena::new();
     let arenas = GlobalArenas::new();
-    let hir_map = hir_map::map_crate(&mut hir_forest, defs);
+    let hir_map = hir_map::map_crate(&sess, &*cstore, &mut hir_forest, &defs);
+    let output_filenames = driver::build_output_filenames(&input,
+                                                          &None,
+                                                          &None,
+                                                          &[],
+                                                          &sess);
 
     abort_on_err(driver::phase_3_run_analysis_passes(&sess,
+                                                     &*cstore,
                                                      hir_map,
                                                      analysis,
                                                      resolutions,
                                                      &arena,
                                                      &arenas,
                                                      &name,
+                                                     &output_filenames,
                                                      |tcx, analysis, _, result| {
         if let Err(_) = result {
             sess.fatal("Compilation failed, aborting rustdoc");
@@ -198,7 +207,7 @@ pub fn run_core(search_paths: SearchPaths,
         };
 
         let ctxt = DocContext {
-            tcx: tcx,
+            tcx,
             populated_all_crate_impls: Cell::new(false),
             access_levels: RefCell::new(access_levels),
             external_traits: Default::default(),
@@ -209,7 +218,7 @@ pub fn run_core(search_paths: SearchPaths,
         debug!("crate: {:?}", tcx.hir.krate());
 
         let krate = {
-            let mut v = RustdocVisitor::new(&ctxt);
+            let mut v = RustdocVisitor::new(&*cstore, &ctxt);
             v.visit(tcx.hir.krate());
             v.clean(&ctxt)
         };

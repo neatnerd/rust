@@ -19,8 +19,6 @@
 // ignore-pretty issue #37195
 // ignore-emscripten spawning processes is not supported
 
-use std::io;
-use std::io::prelude::*;
 use std::env;
 
 #[path = "backtrace-debuginfo-aux.rs"] mod aux;
@@ -33,9 +31,7 @@ macro_rules! dump_and_die {
     ($($pos:expr),*) => ({
         // FIXME(#18285): we cannot include the current position because
         // the macro span takes over the last frame's file/line.
-        if cfg!(any(target_os = "macos",
-                    target_os = "ios",
-                    target_os = "android",
+        if cfg!(any(target_os = "android",
                     all(target_os = "linux", target_arch = "arm"),
                     target_os = "freebsd",
                     target_os = "dragonfly",
@@ -165,7 +161,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() >= 2 {
         let case = args[1].parse().unwrap();
-        writeln!(&mut io::stderr(), "test case {}", case).unwrap();
+        eprintln!("test case {}", case);
         outer(case, pos!());
         println!("done.");
     } else {

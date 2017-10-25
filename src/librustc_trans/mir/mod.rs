@@ -23,7 +23,7 @@ use builder::Builder;
 use common::{self, CrateContext, Funclet};
 use debuginfo::{self, declare_local, VariableAccess, VariableKind, FunctionDebugContext};
 use monomorphize::Instance;
-use abi::FnType;
+use abi::{ArgAttribute, FnType};
 use type_of;
 
 use syntax_pos::{DUMMY_SP, NO_EXPANSION, BytePos, Span};
@@ -129,23 +129,23 @@ impl<'a, 'tcx> MirContext<'a, 'tcx> {
         // In order to have a good line stepping behavior in debugger, we overwrite debug
         // locations of macro expansions with that of the outermost expansion site
         // (unless the crate is being compiled with `-Z debug-macros`).
-        if source_info.span.ctxt == NO_EXPANSION ||
+        if source_info.span.ctxt() == NO_EXPANSION ||
            self.ccx.sess().opts.debugging_opts.debug_macros {
-            let scope = self.scope_metadata_for_loc(source_info.scope, source_info.span.lo);
+            let scope = self.scope_metadata_for_loc(source_info.scope, source_info.span.lo());
             (scope, source_info.span)
         } else {
             // Walk up the macro expansion chain until we reach a non-expanded span.
-            // We also stop at the function body level because no line stepping can occurr
+            // We also stop at the function body level because no line stepping can occur
             // at the level above that.
             let mut span = source_info.span;
-            while span.ctxt != NO_EXPANSION && span.ctxt != self.mir.span.ctxt {
-                if let Some(info) = span.ctxt.outer().expn_info() {
+            while span.ctxt() != NO_EXPANSION && span.ctxt() != self.mir.span.ctxt() {
+                if let Some(info) = span.ctxt().outer().expn_info() {
                     span = info.call_site;
                 } else {
                     break;
                 }
             }
-            let scope = self.scope_metadata_for_loc(source_info.scope, span.lo);
+            let scope = self.scope_metadata_for_loc(source_info.scope, span.lo());
             // Use span of the outermost expansion site, while keeping the original lexical scope.
             (scope, span)
         }
@@ -228,19 +228,19 @@ pub fn trans_mir<'a, 'tcx: 'a>(
     let (landing_pads, funclets) = create_funclets(&bcx, &cleanup_kinds, &block_bcxs);
 
     let mut mircx = MirContext {
-        mir: mir,
-        llfn: llfn,
-        fn_ty: fn_ty,
-        ccx: ccx,
+        mir,
+        llfn,
+        fn_ty,
+        ccx,
         llpersonalityslot: None,
         blocks: block_bcxs,
         unreachable_block: None,
-        cleanup_kinds: cleanup_kinds,
-        landing_pads: landing_pads,
+        cleanup_kinds,
+        landing_pads,
         funclets: &funclets,
-        scopes: scopes,
+        scopes,
         locals: IndexVec::new(),
-        debug_context: debug_context,
+        debug_context,
         param_substs: {
             assert!(!instance.substs.needs_infer());
             instance.substs
@@ -378,6 +378,10 @@ fn arg_local_refs<'a, 'tcx>(bcx: &Builder<'a, 'tcx>,
         None
     };
 
+    let deref_op = unsafe {
+        [llvm::LLVMRustDIBuilderCreateOpDeref()]
+    };
+
     mir.args_iter().enumerate().map(|(arg_index, local)| {
         let arg_decl = &mir.local_decls[local];
         let arg_ty = mircx.monomorphize(&arg_decl.ty);
@@ -432,10 +436,9 @@ fn arg_local_refs<'a, 'tcx>(bcx: &Builder<'a, 'tcx>,
 
         let arg = &mircx.fn_ty.args[idx];
         idx += 1;
-        let llval = if arg.is_indirect() && bcx.sess().opts.debuginfo != FullDebugInfo {
+        let llval = if arg.is_indirect() {
             // Don't copy an indirect argument to an alloca, the caller
-            // already put it in a temporary alloca and gave it up, unless
-            // we emit extra-debug-info, which requires local allocas :(.
+            // already put it in a temporary alloca and gave it up
             // FIXME: lifetimes
             if arg.pad.is_some() {
                 llarg_idx += 1;
@@ -444,8 +447,7 @@ fn arg_local_refs<'a, 'tcx>(bcx: &Builder<'a, 'tcx>,
             llarg_idx += 1;
             llarg
         } else if !lvalue_locals.contains(local.index()) &&
-                  !arg.is_indirect() && arg.cast.is_none() &&
-                  arg_scope.is_none() {
+                  arg.cast.is_none() && arg_scope.is_none() {
             if arg.is_ignore() {
                 return LocalRef::new_operand(bcx.ccx, arg_ty);
             }
@@ -486,7 +488,7 @@ fn arg_local_refs<'a, 'tcx>(bcx: &Builder<'a, 'tcx>,
                 OperandValue::Immediate(llarg)
             };
             let operand = OperandRef {
-                val: val,
+                val,
                 ty: arg_ty
             };
             return LocalRef::Operand(Some(operand.unpack_if_pair(bcx)));
@@ -510,13 +512,26 @@ fn arg_local_refs<'a, 'tcx>(bcx: &Builder<'a, 'tcx>,
         arg_scope.map(|scope| {
             // Is this a regular argument?
             if arg_index > 0 || mir.upvar_decls.is_empty() {
+                // The Rust ABI passes indirect variables using a pointer and a manual copy, so we
+                // need to insert a deref here, but the C ABI uses a pointer and a copy using the
+                // byval attribute, for which LLVM does the deref itself, so we must not add it.
+                let variable_access = if arg.is_indirect() &&
+                    !arg.attrs.contains(ArgAttribute::ByVal) {
+                    VariableAccess::IndirectVariable {
+                        alloca: llval,
+                        address_operations: &deref_op,
+                    }
+                } else {
+                    VariableAccess::DirectVariable { alloca: llval }
+                };
+
                 declare_local(
                     bcx,
                     &mircx.debug_context,
                     arg_decl.name.unwrap_or(keywords::Invalid.name()),
                     arg_ty,
                     scope,
-                    VariableAccess::DirectVariable { alloca: llval },
+                    variable_access,
                     VariableKind::ArgumentVariable(arg_index + 1),
                     DUMMY_SP
                 );
@@ -524,15 +539,15 @@ fn arg_local_refs<'a, 'tcx>(bcx: &Builder<'a, 'tcx>,
             }
 
             // Or is it the closure environment?
-            let (closure_ty, env_ref) = if let ty::TyRef(_, mt) = arg_ty.sty {
-                (mt.ty, true)
-            } else {
-                (arg_ty, false)
+            let (closure_ty, env_ref) = match arg_ty.sty {
+                ty::TyRef(_, mt) | ty::TyRawPtr(mt) => (mt.ty, true),
+                _ => (arg_ty, false)
             };
-            let upvar_tys = if let ty::TyClosure(def_id, substs) = closure_ty.sty {
-                substs.upvar_tys(def_id, tcx)
-            } else {
-                bug!("upvar_decls with non-closure arg0 type `{}`", closure_ty);
+
+            let upvar_tys = match closure_ty.sty {
+                ty::TyClosure(def_id, substs) |
+                ty::TyGenerator(def_id, substs, _) => substs.upvar_tys(def_id, tcx),
+                _ => bug!("upvar_decls with non-closure arg0 type `{}`", closure_ty)
             };
 
             // Store the pointer to closure data in an alloca for debuginfo

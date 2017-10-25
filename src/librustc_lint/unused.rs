@@ -11,106 +11,18 @@
 use rustc::hir::def_id::DefId;
 use rustc::ty;
 use rustc::ty::adjustment;
-use util::nodemap::FxHashMap;
 use lint::{LateContext, EarlyContext, LintContext, LintArray};
 use lint::{LintPass, EarlyLintPass, LateLintPass};
-
-use std::collections::hash_map::Entry::{Occupied, Vacant};
 
 use syntax::ast;
 use syntax::attr;
 use syntax::feature_gate::{BUILTIN_ATTRIBUTES, AttributeType};
+use syntax::print::pprust;
 use syntax::symbol::keywords;
-use syntax::ptr::P;
+use syntax::util::parser;
 use syntax_pos::Span;
 
-use rustc_back::slice;
 use rustc::hir;
-use rustc::hir::intravisit::FnKind;
-
-declare_lint! {
-    pub UNUSED_MUT,
-    Warn,
-    "detect mut variables which don't need to be mutable"
-}
-
-#[derive(Copy, Clone)]
-pub struct UnusedMut;
-
-impl UnusedMut {
-    fn check_unused_mut_pat(&self, cx: &LateContext, pats: &[P<hir::Pat>]) {
-        // collect all mutable pattern and group their NodeIDs by their Identifier to
-        // avoid false warnings in match arms with multiple patterns
-
-        let mut mutables = FxHashMap();
-        for p in pats {
-            p.each_binding(|_, id, span, path1| {
-                let bm = match cx.tables.pat_binding_modes.get(&id) {
-                    Some(&bm) => bm,
-                    None => span_bug!(span, "missing binding mode"),
-                };
-                let name = path1.node;
-                if let ty::BindByValue(hir::MutMutable) = bm {
-                    if !name.as_str().starts_with("_") {
-                        match mutables.entry(name) {
-                            Vacant(entry) => {
-                                entry.insert(vec![id]);
-                            }
-                            Occupied(mut entry) => {
-                                entry.get_mut().push(id);
-                            }
-                        }
-                    }
-                }
-            });
-        }
-
-        let used_mutables = cx.tcx.used_mut_nodes.borrow();
-        for (_, v) in &mutables {
-            if !v.iter().any(|e| used_mutables.contains(e)) {
-                cx.span_lint(UNUSED_MUT,
-                             cx.tcx.hir.span(v[0]),
-                             "variable does not need to be mutable");
-            }
-        }
-    }
-}
-
-impl LintPass for UnusedMut {
-    fn get_lints(&self) -> LintArray {
-        lint_array!(UNUSED_MUT)
-    }
-}
-
-impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnusedMut {
-    fn check_expr(&mut self, cx: &LateContext, e: &hir::Expr) {
-        if let hir::ExprMatch(_, ref arms, _) = e.node {
-            for a in arms {
-                self.check_unused_mut_pat(cx, &a.pats)
-            }
-        }
-    }
-
-    fn check_stmt(&mut self, cx: &LateContext, s: &hir::Stmt) {
-        if let hir::StmtDecl(ref d, _) = s.node {
-            if let hir::DeclLocal(ref l) = d.node {
-                self.check_unused_mut_pat(cx, slice::ref_slice(&l.pat));
-            }
-        }
-    }
-
-    fn check_fn(&mut self,
-                cx: &LateContext,
-                _: FnKind,
-                _: &hir::FnDecl,
-                body: &hir::Body,
-                _: Span,
-                _: ast::NodeId) {
-        for a in &body.arguments {
-            self.check_unused_mut_pat(cx, slice::ref_slice(&a.pat));
-        }
-    }
-}
 
 declare_lint! {
     pub UNUSED_MUST_USE,
@@ -145,22 +57,66 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnusedResults {
         }
 
         let t = cx.tables.expr_ty(&expr);
-        let warned = match t.sty {
+        let ty_warned = match t.sty {
             ty::TyTuple(ref tys, _) if tys.is_empty() => return,
             ty::TyNever => return,
-            ty::TyBool => return,
-            ty::TyAdt(def, _) => check_must_use(cx, def.did, s.span),
+            ty::TyAdt(def, _) => {
+                if def.variants.is_empty() {
+                    return;
+                } else {
+                    check_must_use(cx, def.did, s.span, "")
+                }
+            },
             _ => false,
         };
-        if !warned {
+
+        let mut fn_warned = false;
+        let mut op_warned = false;
+        if cx.tcx.sess.features.borrow().fn_must_use {
+            let maybe_def = match expr.node {
+                hir::ExprCall(ref callee, _) => {
+                    match callee.node {
+                        hir::ExprPath(ref qpath) => {
+                            Some(cx.tables.qpath_def(qpath, callee.hir_id))
+                        },
+                        _ => None
+                    }
+                },
+                hir::ExprMethodCall(..) => {
+                    cx.tables.type_dependent_defs().get(expr.hir_id).cloned()
+                },
+                _ => None
+            };
+            if let Some(def) = maybe_def {
+                let def_id = def.def_id();
+                fn_warned = check_must_use(cx, def_id, s.span, "return value of ");
+            }
+
+            if let hir::ExprBinary(bin_op, ..) = expr.node {
+                match bin_op.node {
+                    // Hardcoding the comparison operators here seemed more
+                    // expedient than the refactoring that would be needed to
+                    // look up the `#[must_use]` attribute which does exist on
+                    // the comparison trait methods
+                    hir::BiEq | hir::BiLt | hir::BiLe | hir::BiNe | hir::BiGe | hir::BiGt => {
+                        let msg = "unused comparison which must be used";
+                        cx.span_lint(UNUSED_MUST_USE, expr.span, msg);
+                        op_warned = true;
+                    },
+                    _ => {},
+                }
+            }
+        }
+
+        if !(ty_warned || fn_warned || op_warned) {
             cx.span_lint(UNUSED_RESULTS, s.span, "unused result");
         }
 
-        fn check_must_use(cx: &LateContext, def_id: DefId, sp: Span) -> bool {
+        fn check_must_use(cx: &LateContext, def_id: DefId, sp: Span, describe_path: &str) -> bool {
             for attr in cx.tcx.get_attrs(def_id).iter() {
                 if attr.check_name("must_use") {
-                    let mut msg = format!("unused `{}` which must be used",
-                                          cx.tcx.item_path_str(def_id));
+                    let mut msg = format!("unused {}`{}` which must be used",
+                                          describe_path, cx.tcx.item_path_str(def_id));
                     // check for #[must_use="..."]
                     if let Some(s) = attr.value_str() {
                         msg.push_str(": ");
@@ -171,60 +127,6 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnusedResults {
                 }
             }
             false
-        }
-    }
-}
-
-declare_lint! {
-    pub UNUSED_UNSAFE,
-    Warn,
-    "unnecessary use of an `unsafe` block"
-}
-
-#[derive(Copy, Clone)]
-pub struct UnusedUnsafe;
-
-impl LintPass for UnusedUnsafe {
-    fn get_lints(&self) -> LintArray {
-        lint_array!(UNUSED_UNSAFE)
-    }
-}
-
-impl<'a, 'tcx> LateLintPass<'a, 'tcx> for UnusedUnsafe {
-    fn check_expr(&mut self, cx: &LateContext, e: &hir::Expr) {
-        /// Return the NodeId for an enclosing scope that is also `unsafe`
-        fn is_enclosed(cx: &LateContext, id: ast::NodeId) -> Option<(String, ast::NodeId)> {
-            let parent_id = cx.tcx.hir.get_parent_node(id);
-            if parent_id != id {
-                if cx.tcx.used_unsafe.borrow().contains(&parent_id) {
-                    Some(("block".to_string(), parent_id))
-                } else if let Some(hir::map::NodeItem(&hir::Item {
-                    node: hir::ItemFn(_, hir::Unsafety::Unsafe, _, _, _, _),
-                    ..
-                })) = cx.tcx.hir.find(parent_id) {
-                    Some(("fn".to_string(), parent_id))
-                } else {
-                    is_enclosed(cx, parent_id)
-                }
-            } else {
-                None
-            }
-        }
-        if let hir::ExprBlock(ref blk) = e.node {
-            // Don't warn about generated blocks, that'll just pollute the output.
-            if blk.rules == hir::UnsafeBlock(hir::UserProvided) &&
-               !cx.tcx.used_unsafe.borrow().contains(&blk.id) {
-
-                let mut db = cx.struct_span_lint(UNUSED_UNSAFE, blk.span,
-                                                 "unnecessary `unsafe` block");
-
-                db.span_label(blk.span, "unnecessary `unsafe` block");
-                if let Some((kind, id)) = is_enclosed(cx, blk.id) {
-                    db.span_note(cx.tcx.hir.span(id),
-                                 &format!("because it's nested under this `unsafe` {}", kind));
-                }
-                db.emit();
-            }
         }
     }
 }
@@ -338,45 +240,43 @@ impl UnusedParens {
                                 msg: &str,
                                 struct_lit_needs_parens: bool) {
         if let ast::ExprKind::Paren(ref inner) = value.node {
-            let necessary = struct_lit_needs_parens && contains_exterior_struct_lit(&inner);
+            let necessary = struct_lit_needs_parens &&
+                            parser::contains_exterior_struct_lit(&inner);
             if !necessary {
-                cx.span_lint(UNUSED_PARENS,
-                             value.span,
-                             &format!("unnecessary parentheses around {}", msg))
-            }
-        }
-
-        /// Expressions that syntactically contain an "exterior" struct
-        /// literal i.e. not surrounded by any parens or other
-        /// delimiters, e.g. `X { y: 1 }`, `X { y: 1 }.method()`, `foo
-        /// == X { y: 1 }` and `X { y: 1 } == foo` all do, but `(X {
-        /// y: 1 }) == foo` does not.
-        fn contains_exterior_struct_lit(value: &ast::Expr) -> bool {
-            match value.node {
-                ast::ExprKind::Struct(..) => true,
-
-                ast::ExprKind::Assign(ref lhs, ref rhs) |
-                ast::ExprKind::AssignOp(_, ref lhs, ref rhs) |
-                ast::ExprKind::Binary(_, ref lhs, ref rhs) => {
-                    // X { y: 1 } + X { y: 2 }
-                    contains_exterior_struct_lit(&lhs) || contains_exterior_struct_lit(&rhs)
-                }
-                ast::ExprKind::Unary(_, ref x) |
-                ast::ExprKind::Cast(ref x, _) |
-                ast::ExprKind::Type(ref x, _) |
-                ast::ExprKind::Field(ref x, _) |
-                ast::ExprKind::TupField(ref x, _) |
-                ast::ExprKind::Index(ref x, _) => {
-                    // &X { y: 1 }, X { y: 1 }.y
-                    contains_exterior_struct_lit(&x)
-                }
-
-                ast::ExprKind::MethodCall(.., ref exprs) => {
-                    // X { y: 1 }.bar(...)
-                    contains_exterior_struct_lit(&exprs[0])
-                }
-
-                _ => false,
+                let span_msg = format!("unnecessary parentheses around {}", msg);
+                let mut err = cx.struct_span_lint(UNUSED_PARENS,
+                                                  value.span,
+                                                  &span_msg);
+                // Remove exactly one pair of parentheses (rather than naïvely
+                // stripping all paren characters)
+                let mut ate_left_paren = false;
+                let mut ate_right_paren = false;
+                let parens_removed = pprust::expr_to_string(value)
+                    .trim_matches(|c| {
+                        match c {
+                            '(' => {
+                                if ate_left_paren {
+                                    false
+                                } else {
+                                    ate_left_paren = true;
+                                    true
+                                }
+                            },
+                            ')' => {
+                                if ate_right_paren {
+                                    false
+                                } else {
+                                    ate_right_paren = true;
+                                    true
+                                }
+                            },
+                            _ => false,
+                        }
+                    }).to_owned();
+                err.span_suggestion_short(value.span,
+                                          "remove these parentheses",
+                                          parens_removed);
+                err.emit();
             }
         }
     }

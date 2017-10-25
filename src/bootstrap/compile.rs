@@ -29,9 +29,10 @@ use build_helper::{output, mtime, up_to_date};
 use filetime::FileTime;
 use serde_json;
 
-use util::{exe, libdir, is_dylib, copy};
+use util::{exe, libdir, is_dylib, copy, read_stamp_file, CiEnv};
 use {Build, Compiler, Mode};
 use native;
+use tool;
 
 use cache::{INTERNER, Interned};
 use builder::{Step, RunConfig, ShouldRun, Builder};
@@ -73,13 +74,21 @@ impl Step for Std {
             let from = builder.compiler(1, build.build);
             builder.ensure(Std {
                 compiler: from,
-                target: target,
+                target,
             });
             println!("Uplifting stage1 std ({} -> {})", from.host, target);
+
+            // Even if we're not building std this stage, the new sysroot must
+            // still contain the musl startup objects.
+            if target.contains("musl") && !target.contains("mips") {
+                let libdir = builder.sysroot_libdir(compiler, target);
+                copy_musl_third_party_objects(build, target, &libdir);
+            }
+
             builder.ensure(StdLink {
                 compiler: from,
                 target_compiler: compiler,
-                target: target,
+                target,
             });
             return;
         }
@@ -88,7 +97,12 @@ impl Step for Std {
         println!("Building stage{} std artifacts ({} -> {})", compiler.stage,
                 &compiler.host, target);
 
-        let out_dir = build.cargo_out(compiler, Mode::Libstd, target);
+        if target.contains("musl") && !target.contains("mips") {
+            let libdir = builder.sysroot_libdir(compiler, target);
+            copy_musl_third_party_objects(build, target, &libdir);
+        }
+
+        let out_dir = build.stage_out(compiler, Mode::Libstd);
         build.clear_if_dirty(&out_dir, &builder.rustc(compiler));
         let mut cargo = builder.cargo(compiler, Mode::Libstd, target, "build");
         std_cargo(build, &compiler, target, &mut cargo);
@@ -99,8 +113,22 @@ impl Step for Std {
         builder.ensure(StdLink {
             compiler: builder.compiler(compiler.stage, build.build),
             target_compiler: compiler,
-            target: target,
+            target,
         });
+    }
+}
+
+/// Copies the crt(1,i,n).o startup objects
+///
+/// Since musl supports fully static linking, we can cross link for it even
+/// with a glibc-targeting toolchain, given we have the appropriate startup
+/// files. As those shipped with glibc won't work, copy the ones provided by
+/// musl so we have them on linux-gnu hosts.
+fn copy_musl_third_party_objects(build: &Build,
+                                 target: Interned<String>,
+                                 into: &Path) {
+    for &obj in &["crt1.o", "crti.o", "crtn.o"] {
+        copy(&build.musl_root(target).unwrap().join("lib").join(obj), &into.join(obj));
     }
 }
 
@@ -188,25 +216,18 @@ impl Step for StdLink {
         let libdir = builder.sysroot_libdir(target_compiler, target);
         add_to_sysroot(&libdir, &libstd_stamp(build, compiler, target));
 
-        if target.contains("musl") && !target.contains("mips") {
-            copy_musl_third_party_objects(build, target, &libdir);
-        }
-
         if build.config.sanitizers && compiler.stage != 0 && target == "x86_64-apple-darwin" {
             // The sanitizers are only built in stage1 or above, so the dylibs will
             // be missing in stage0 and causes panic. See the `std()` function above
             // for reason why the sanitizers are not built in stage0.
             copy_apple_sanitizer_dylibs(&build.native_dir(target), "osx", &libdir);
         }
-    }
-}
 
-/// Copies the crt(1,i,n).o startup objects
-///
-/// Only required for musl targets that statically link to libc
-fn copy_musl_third_party_objects(build: &Build, target: Interned<String>, into: &Path) {
-    for &obj in &["crt1.o", "crti.o", "crtn.o"] {
-        copy(&build.musl_root(target).unwrap().join("lib").join(obj), &into.join(obj));
+        builder.ensure(tool::CleanTools {
+            compiler: target_compiler,
+            target,
+            mode: Mode::Libstd,
+        });
     }
 }
 
@@ -319,13 +340,13 @@ impl Step for Test {
         if build.force_use_stage1(compiler, target) {
             builder.ensure(Test {
                 compiler: builder.compiler(1, build.build),
-                target: target,
+                target,
             });
             println!("Uplifting stage1 test ({} -> {})", &build.build, target);
             builder.ensure(TestLink {
                 compiler: builder.compiler(1, build.build),
                 target_compiler: compiler,
-                target: target,
+                target,
             });
             return;
         }
@@ -333,7 +354,7 @@ impl Step for Test {
         let _folder = build.fold_output(|| format!("stage{}-test", compiler.stage));
         println!("Building stage{} test artifacts ({} -> {})", compiler.stage,
                 &compiler.host, target);
-        let out_dir = build.cargo_out(compiler, Mode::Libtest, target);
+        let out_dir = build.stage_out(compiler, Mode::Libtest);
         build.clear_if_dirty(&out_dir, &libstd_stamp(build, compiler, target));
         let mut cargo = builder.cargo(compiler, Mode::Libtest, target, "build");
         test_cargo(build, &compiler, target, &mut cargo);
@@ -344,7 +365,7 @@ impl Step for Test {
         builder.ensure(TestLink {
             compiler: builder.compiler(compiler.stage, build.build),
             target_compiler: compiler,
-            target: target,
+            target,
         });
     }
 }
@@ -389,6 +410,11 @@ impl Step for TestLink {
                 target);
         add_to_sysroot(&builder.sysroot_libdir(target_compiler, target),
                     &libtest_stamp(build, compiler, target));
+        builder.ensure(tool::CleanTools {
+            compiler: target_compiler,
+            target,
+            mode: Mode::Libtest,
+        });
     }
 }
 
@@ -433,7 +459,7 @@ impl Step for Rustc {
         if build.force_use_stage1(compiler, target) {
             builder.ensure(Rustc {
                 compiler: builder.compiler(1, build.build),
-                target: target,
+                target,
             });
             println!("Uplifting stage1 rustc ({} -> {})", &build.build, target);
             builder.ensure(RustcLink {
@@ -454,8 +480,9 @@ impl Step for Rustc {
         println!("Building stage{} compiler artifacts ({} -> {})",
                  compiler.stage, &compiler.host, target);
 
-        let out_dir = build.cargo_out(compiler, Mode::Librustc, target);
-        build.clear_if_dirty(&out_dir, &libtest_stamp(build, compiler, target));
+        let stage_out = builder.stage_out(compiler, Mode::Librustc);
+        build.clear_if_dirty(&stage_out, &libstd_stamp(build, compiler, target));
+        build.clear_if_dirty(&stage_out, &libtest_stamp(build, compiler, target));
 
         let mut cargo = builder.cargo(compiler, Mode::Librustc, target, "build");
         rustc_cargo(build, &compiler, target, &mut cargo);
@@ -534,9 +561,6 @@ pub fn rustc_cargo(build: &Build,
     if let Some(ref s) = build.config.rustc_default_linker {
         cargo.env("CFG_DEFAULT_LINKER", s);
     }
-    if let Some(ref s) = build.config.rustc_default_ar {
-        cargo.env("CFG_DEFAULT_AR", s);
-    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -567,6 +591,11 @@ impl Step for RustcLink {
                  target);
         add_to_sysroot(&builder.sysroot_libdir(target_compiler, target),
                        &librustc_stamp(build, compiler, target));
+        builder.ensure(tool::CleanTools {
+            compiler: target_compiler,
+            target,
+            mode: Mode::Librustc,
+        });
     }
 }
 
@@ -679,10 +708,10 @@ impl Step for Assemble {
         // link to these. (FIXME: Is that correct? It seems to be correct most
         // of the time but I think we do link to these for stage2/bin compilers
         // when not performing a full bootstrap).
-        if builder.build.flags.keep_stage.map_or(false, |s| target_compiler.stage <= s) {
+        if builder.build.config.keep_stage.map_or(false, |s| target_compiler.stage <= s) {
             builder.verbose("skipping compilation of compiler due to --keep-stage");
             let compiler = build_compiler;
-            for stage in 0..min(target_compiler.stage, builder.flags.keep_stage.unwrap()) {
+            for stage in 0..min(target_compiler.stage, builder.config.keep_stage.unwrap()) {
                 let target_compiler = builder.compiler(stage, target_compiler.host);
                 let target = target_compiler.host;
                 builder.ensure(StdLink { compiler, target_compiler, target });
@@ -729,15 +758,7 @@ impl Step for Assemble {
 /// `sysroot_dst` provided.
 fn add_to_sysroot(sysroot_dst: &Path, stamp: &Path) {
     t!(fs::create_dir_all(&sysroot_dst));
-    let mut contents = Vec::new();
-    t!(t!(File::open(stamp)).read_to_end(&mut contents));
-    // This is the method we use for extracting paths from the stamp file passed to us. See
-    // run_cargo for more information (in this file).
-    for part in contents.split(|b| *b == 0) {
-        if part.is_empty() {
-            continue
-        }
-        let path = Path::new(t!(str::from_utf8(part)));
+    for path in read_stamp_file(stamp) {
         copy(&path, &sysroot_dst.join(path.file_name().unwrap()));
     }
 }
@@ -771,7 +792,7 @@ fn run_cargo(build: &Build, cargo: &mut Command, stamp: &Path) {
     cargo.arg("--message-format").arg("json")
          .stdout(Stdio::piped());
 
-    if stderr_isatty() {
+    if stderr_isatty() && build.ci_env == CiEnv::None {
         // since we pass message-format=json to cargo, we need to tell the rustc
         // wrapper to give us colored output if necessary. This is because we
         // only want Cargo's JSON output, not rustcs.
@@ -910,6 +931,8 @@ fn run_cargo(build: &Build, cargo: &mut Command, stamp: &Path) {
     let max = max.unwrap();
     let max_path = max_path.unwrap();
     if stamp_contents == new_contents && max <= stamp_mtime {
+        build.verbose(&format!("not updating {:?}; contents equal and {} <= {}",
+                stamp, max, stamp_mtime));
         return
     }
     if max > stamp_mtime {

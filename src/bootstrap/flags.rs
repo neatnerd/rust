@@ -33,7 +33,8 @@ pub struct Flags {
     pub on_fail: Option<String>,
     pub stage: Option<u32>,
     pub keep_stage: Option<u32>,
-    pub build: Interned<String>,
+    pub build: Option<Interned<String>>,
+
     pub host: Vec<Interned<String>>,
     pub target: Vec<Interned<String>>,
     pub config: Option<PathBuf>,
@@ -59,13 +60,23 @@ pub enum Subcommand {
         paths: Vec<PathBuf>,
         test_args: Vec<String>,
     },
-    Clean,
+    Clean {
+        all: bool,
+    },
     Dist {
         paths: Vec<PathBuf>,
     },
     Install {
         paths: Vec<PathBuf>,
     },
+}
+
+impl Default for Subcommand {
+    fn default() -> Subcommand {
+        Subcommand::Build {
+            paths: vec![PathBuf::from("nowhere")],
+        }
+    }
 }
 
 impl Flags {
@@ -127,7 +138,7 @@ To learn more about a subcommand, run `./x.py <subcommand> -h`");
             None => {
                 // No subcommand -- show the general usage and subcommand help
                 println!("{}\n", subcommand_help);
-                process::exit(0);
+                process::exit(1);
             }
         };
 
@@ -138,6 +149,7 @@ To learn more about a subcommand, run `./x.py <subcommand> -h`");
                 opts.optmulti("", "test-args", "extra arguments", "ARGS");
             },
             "bench" => { opts.optmulti("", "test-args", "extra arguments", "ARGS"); },
+            "clean" => { opts.optflag("", "all", "clean all build artifacts"); },
             _ => { },
         };
 
@@ -241,19 +253,18 @@ Arguments:
             }
         });
 
-        // All subcommands can have an optional "Available paths" section
+        // All subcommands except `clean` can have an optional "Available paths" section
         if matches.opt_present("verbose") {
-            let flags = Flags::parse(&["build".to_string()]);
-            let mut config = Config::parse(&flags.build, cfg_file.clone());
-            config.build = flags.build.clone();
-            let mut build = Build::new(flags, config);
+            let config = Config::parse(&["build".to_string()]);
+            let mut build = Build::new(config);
             metadata::build(&mut build);
 
             let maybe_rules_help = Builder::get_help(&build, subcommand.as_str());
             extra_help.push_str(maybe_rules_help.unwrap_or_default().as_str());
-        } else {
-            extra_help.push_str(format!("Run `./x.py {} -h -v` to see a list of available paths.",
-                     subcommand).as_str());
+        } else if subcommand.as_str() != "clean" {
+            extra_help.push_str(format!(
+                "Run `./x.py {} -h -v` to see a list of available paths.",
+                subcommand).as_str());
         }
 
         // User passed in -h/--help?
@@ -267,14 +278,14 @@ Arguments:
             }
             "test" => {
                 Subcommand::Test {
-                    paths: paths,
+                    paths,
                     test_args: matches.opt_strs("test-args"),
                     fail_fast: !matches.opt_present("no-fail-fast"),
                 }
             }
             "bench" => {
                 Subcommand::Bench {
-                    paths: paths,
+                    paths,
                     test_args: matches.opt_strs("test-args"),
                 }
             }
@@ -283,19 +294,22 @@ Arguments:
             }
             "clean" => {
                 if paths.len() > 0 {
-                    println!("\nclean takes no arguments\n");
+                    println!("\nclean does not take a path argument\n");
                     usage(1, &opts, &subcommand_help, &extra_help);
                 }
-                Subcommand::Clean
+
+                Subcommand::Clean {
+                    all: matches.opt_present("all"),
+                }
             }
             "dist" => {
                 Subcommand::Dist {
-                    paths: paths,
+                    paths,
                 }
             }
             "install" => {
                 Subcommand::Install {
-                    paths: paths,
+                    paths,
                 }
             }
             _ => {
@@ -317,20 +331,18 @@ Arguments:
 
         Flags {
             verbose: matches.opt_count("verbose"),
-            stage: stage,
+            stage,
             on_fail: matches.opt_str("on-fail"),
             keep_stage: matches.opt_str("keep-stage").map(|j| j.parse().unwrap()),
-            build: INTERNER.intern_string(matches.opt_str("build").unwrap_or_else(|| {
-                env::var("BUILD").unwrap()
-            })),
+            build: matches.opt_str("build").map(|s| INTERNER.intern_string(s)),
             host: split(matches.opt_strs("host"))
                 .into_iter().map(|x| INTERNER.intern_string(x)).collect::<Vec<_>>(),
             target: split(matches.opt_strs("target"))
                 .into_iter().map(|x| INTERNER.intern_string(x)).collect::<Vec<_>>(),
             config: cfg_file,
-            src: src,
+            src,
             jobs: matches.opt_str("jobs").map(|j| j.parse().unwrap()),
-            cmd: cmd,
+            cmd,
             incremental: matches.opt_present("incremental"),
         }
     }

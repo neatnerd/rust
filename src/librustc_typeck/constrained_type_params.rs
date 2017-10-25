@@ -8,7 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use rustc::ty::{self, Ty};
+use rustc::ty::{self, Ty, TyCtxt};
 use rustc::ty::fold::{TypeFoldable, TypeVisitor};
 use rustc::util::nodemap::FxHashSet;
 
@@ -48,7 +48,7 @@ pub fn parameters_for<'tcx, T>(t: &T,
 
     let mut collector = ParameterCollector {
         parameters: vec![],
-        include_nonconstraining: include_nonconstraining
+        include_nonconstraining,
     };
     t.visit_with(&mut collector);
     collector.parameters
@@ -86,7 +86,7 @@ impl<'tcx> TypeVisitor<'tcx> for ParameterCollector {
     }
 }
 
-pub fn identify_constrained_type_params<'tcx>(tcx: ty::TyCtxt,
+pub fn identify_constrained_type_params<'tcx>(tcx: TyCtxt,
                                               predicates: &[ty::Predicate<'tcx>],
                                               impl_trait_ref: Option<ty::TraitRef<'tcx>>,
                                               input_parameters: &mut FxHashSet<Parameter>)
@@ -98,7 +98,7 @@ pub fn identify_constrained_type_params<'tcx>(tcx: ty::TyCtxt,
 
 /// Order the predicates in `predicates` such that each parameter is
 /// constrained before it is used, if that is possible, and add the
-/// paramaters so constrained to `input_parameters`. For example,
+/// parameters so constrained to `input_parameters`. For example,
 /// imagine the following impl:
 ///
 ///     impl<T: Debug, U: Iterator<Item=T>> Trait for U
@@ -136,7 +136,7 @@ pub fn identify_constrained_type_params<'tcx>(tcx: ty::TyCtxt,
 /// which is determined by 1, which requires `U`, that is determined
 /// by 0. I should probably pick a less tangled example, but I can't
 /// think of any.
-pub fn setup_constraining_predicates<'tcx>(tcx: ty::TyCtxt,
+pub fn setup_constraining_predicates<'tcx>(tcx: TyCtxt,
                                            predicates: &mut [ty::Predicate<'tcx>],
                                            impl_trait_ref: Option<ty::TraitRef<'tcx>>,
                                            input_parameters: &mut FxHashSet<Parameter>)

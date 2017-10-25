@@ -9,6 +9,7 @@
 // except according to those terms.
 
 use hir::def_id::DefId;
+use middle::const_val::{ConstVal, ConstAggregate};
 use infer::InferCtxt;
 use ty::subst::Substs;
 use traits;
@@ -58,7 +59,7 @@ pub fn trait_obligations<'a, 'gcx, 'tcx>(infcx: &InferCtxt<'a, 'gcx, 'tcx>,
                                          -> Vec<traits::PredicateObligation<'tcx>>
 {
     let mut wf = WfPredicates { infcx, param_env, body_id, span, out: vec![] };
-    wf.compute_trait_ref(trait_ref);
+    wf.compute_trait_ref(trait_ref, Elaborate::All);
     wf.normalize()
 }
 
@@ -74,7 +75,7 @@ pub fn predicate_obligations<'a, 'gcx, 'tcx>(infcx: &InferCtxt<'a, 'gcx, 'tcx>,
     // (*) ok to skip binders, because wf code is prepared for it
     match *predicate {
         ty::Predicate::Trait(ref t) => {
-            wf.compute_trait_ref(&t.skip_binder().trait_ref); // (*)
+            wf.compute_trait_ref(&t.skip_binder().trait_ref, Elaborate::None); // (*)
         }
         ty::Predicate::Equate(ref t) => {
             wf.compute(t.skip_binder().0);
@@ -101,6 +102,14 @@ pub fn predicate_obligations<'a, 'gcx, 'tcx>(infcx: &InferCtxt<'a, 'gcx, 'tcx>,
             wf.compute(data.skip_binder().a); // (*)
             wf.compute(data.skip_binder().b); // (*)
         }
+        ty::Predicate::ConstEvaluatable(def_id, substs) => {
+            let obligations = wf.nominal_obligations(def_id, substs);
+            wf.out.extend(obligations);
+
+            for ty in substs.types() {
+                wf.compute(ty);
+            }
+        }
     }
 
     wf.normalize()
@@ -112,6 +121,35 @@ struct WfPredicates<'a, 'gcx: 'a+'tcx, 'tcx: 'a> {
     body_id: ast::NodeId,
     span: Span,
     out: Vec<traits::PredicateObligation<'tcx>>,
+}
+
+/// Controls whether we "elaborate" supertraits and so forth on the WF
+/// predicates. This is a kind of hack to address #43784. The
+/// underlying problem in that issue was a trait structure like:
+///
+/// ```
+/// trait Foo: Copy { }
+/// trait Bar: Foo { }
+/// impl<T: Bar> Foo for T { }
+/// impl<T> Bar for T { }
+/// ```
+///
+/// Here, in the `Foo` impl, we will check that `T: Copy` holds -- but
+/// we decide that this is true because `T: Bar` is in the
+/// where-clauses (and we can elaborate that to include `T:
+/// Copy`). This wouldn't be a problem, except that when we check the
+/// `Bar` impl, we decide that `T: Foo` must hold because of the `Foo`
+/// impl. And so nowhere did we check that `T: Copy` holds!
+///
+/// To resolve this, we elaborate the WF requirements that must be
+/// proven when checking impls. This means that (e.g.) the `impl Bar
+/// for T` will be forced to prove not only that `T: Foo` but also `T:
+/// Copy` (which it won't be able to do, because there is no `Copy`
+/// impl for `T`).
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+enum Elaborate {
+    All,
+    None,
 }
 
 impl<'a, 'gcx, 'tcx> WfPredicates<'a, 'gcx, 'tcx> {
@@ -135,12 +173,25 @@ impl<'a, 'gcx, 'tcx> WfPredicates<'a, 'gcx, 'tcx> {
 
     /// Pushes the obligations required for `trait_ref` to be WF into
     /// `self.out`.
-    fn compute_trait_ref(&mut self, trait_ref: &ty::TraitRef<'tcx>) {
+    fn compute_trait_ref(&mut self, trait_ref: &ty::TraitRef<'tcx>, elaborate: Elaborate) {
         let obligations = self.nominal_obligations(trait_ref.def_id, trait_ref.substs);
-        self.out.extend(obligations);
 
         let cause = self.cause(traits::MiscObligation);
         let param_env = self.param_env;
+
+        if let Elaborate::All = elaborate {
+            let predicates = obligations.iter()
+                                        .map(|obligation| obligation.predicate.clone())
+                                        .collect();
+            let implied_obligations = traits::elaborate_predicates(self.infcx.tcx, predicates);
+            let implied_obligations = implied_obligations.map(|pred| {
+                traits::Obligation::new(cause.clone(), param_env, pred)
+            });
+            self.out.extend(implied_obligations);
+        }
+
+        self.out.extend(obligations);
+
         self.out.extend(
             trait_ref.substs.types()
                             .filter(|ty| !ty.has_escaping_regions())
@@ -156,12 +207,52 @@ impl<'a, 'gcx, 'tcx> WfPredicates<'a, 'gcx, 'tcx> {
         // WF and (b) the trait-ref holds.  (It may also be
         // normalizable and be WF that way.)
         let trait_ref = data.trait_ref(self.infcx.tcx);
-        self.compute_trait_ref(&trait_ref);
+        self.compute_trait_ref(&trait_ref, Elaborate::None);
 
         if !data.has_escaping_regions() {
             let predicate = trait_ref.to_predicate();
             let cause = self.cause(traits::ProjectionWf(data));
             self.out.push(traits::Obligation::new(cause, self.param_env, predicate));
+        }
+    }
+
+    /// Pushes the obligations required for a constant value to be WF
+    /// into `self.out`.
+    fn compute_const(&mut self, constant: &'tcx ty::Const<'tcx>) {
+        self.require_sized(constant.ty, traits::ConstSized);
+        match constant.val {
+            ConstVal::Integral(_) |
+            ConstVal::Float(_) |
+            ConstVal::Str(_) |
+            ConstVal::ByteStr(_) |
+            ConstVal::Bool(_) |
+            ConstVal::Char(_) |
+            ConstVal::Variant(_) |
+            ConstVal::Function(..) => {}
+            ConstVal::Aggregate(ConstAggregate::Struct(fields)) => {
+                for &(_, v) in fields {
+                    self.compute_const(v);
+                }
+            }
+            ConstVal::Aggregate(ConstAggregate::Tuple(fields)) |
+            ConstVal::Aggregate(ConstAggregate::Array(fields)) => {
+                for v in fields {
+                    self.compute_const(v);
+                }
+            }
+            ConstVal::Aggregate(ConstAggregate::Repeat(v, _)) => {
+                self.compute_const(v);
+            }
+            ConstVal::Unevaluated(def_id, substs) => {
+                let obligations = self.nominal_obligations(def_id, substs);
+                self.out.extend(obligations);
+
+                let predicate = ty::Predicate::ConstEvaluatable(def_id, substs);
+                let cause = self.cause(traits::MiscObligation);
+                self.out.push(traits::Obligation::new(cause,
+                                                      self.param_env,
+                                                      predicate));
+            }
         }
     }
 
@@ -197,9 +288,14 @@ impl<'a, 'gcx, 'tcx> WfPredicates<'a, 'gcx, 'tcx> {
                     // WfScalar, WfParameter, etc
                 }
 
-                ty::TySlice(subty) |
-                ty::TyArray(subty, _) => {
+                ty::TySlice(subty) => {
                     self.require_sized(subty, traits::SliceOrArrayElem);
+                }
+
+                ty::TyArray(subty, len) => {
+                    self.require_sized(subty, traits::SliceOrArrayElem);
+                    assert_eq!(len.ty, self.infcx.tcx.types.usize);
+                    self.compute_const(len);
                 }
 
                 ty::TyTuple(ref tys, _) => {
@@ -239,8 +335,8 @@ impl<'a, 'gcx, 'tcx> WfPredicates<'a, 'gcx, 'tcx> {
                     }
                 }
 
-                ty::TyClosure(..) => {
-                    // the types in a closure are always the types of
+                ty::TyGenerator(..) | ty::TyClosure(..) => {
+                    // the types in a closure or generator are always the types of
                     // local variables (or possibly references to local
                     // variables), we'll walk those.
                     //

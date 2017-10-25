@@ -134,8 +134,8 @@ impl PathSegment {
     }
     pub fn crate_root(span: Span) -> Self {
         PathSegment {
-            identifier: Ident { ctxt: span.ctxt, ..keywords::CrateRoot.ident() },
-            span: span,
+            identifier: Ident { ctxt: span.ctxt(), ..keywords::CrateRoot.ident() },
+            span,
             parameters: None,
         }
     }
@@ -538,8 +538,14 @@ pub enum BindingMode {
 
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
 pub enum RangeEnd {
-    Included,
+    Included(RangeSyntax),
     Excluded,
+}
+
+#[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
+pub enum RangeSyntax {
+    DotDotDot,
+    DotDotEq,
 }
 
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
@@ -563,8 +569,8 @@ pub enum PatKind {
     TupleStruct(Path, Vec<P<Pat>>, Option<usize>),
 
     /// A possibly qualified path pattern.
-    /// Unquailfied path patterns `A::B::C` can legally refer to variants, structs, constants
-    /// or associated constants. Quailfied path patterns `<A>::B::C`/`<A as Trait>::B::C` can
+    /// Unqualified path patterns `A::B::C` can legally refer to variants, structs, constants
+    /// or associated constants. Qualified path patterns `<A>::B::C`/`<A as Trait>::B::C` can
     /// only legally refer to associated constants.
     Path(Option<QSelf>, Path),
 
@@ -578,7 +584,7 @@ pub enum PatKind {
     Ref(P<Pat>, Mutability),
     /// A literal
     Lit(P<Expr>),
-    /// A range pattern, e.g. `1...2` or `1..2`
+    /// A range pattern, e.g. `1...2`, `1..=2` or `1..2`
     Range(P<Expr>, P<Expr>, RangeEnd),
     /// `[a, b, ..i, y, z]` is represented as:
     ///     `PatKind::Slice(box [a, b], Some(i), box [y, z])`
@@ -761,9 +767,9 @@ pub enum StmtKind {
 
     /// Expr without trailing semi-colon.
     Expr(P<Expr>),
-
+    /// Expr with a trailing semi-colon.
     Semi(P<Expr>),
-
+    /// Macro.
     Mac(P<(Mac, MacStmtStyle, ThinVec<Attribute>)>),
 }
 
@@ -780,8 +786,6 @@ pub enum MacStmtStyle {
     NoBraces,
 }
 
-// FIXME (pending discussion of #1697, #2178...): local should really be
-// a refinement on pat.
 /// Local represents a `let` statement, e.g., `let <pat>:<ty> = <expr>;`
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
 pub struct Local {
@@ -810,6 +814,7 @@ pub struct Arm {
     pub pats: Vec<P<Pat>>,
     pub guard: Option<P<Expr>>,
     pub body: P<Expr>,
+    pub beginning_vert: Option<Span>, // For RFC 1925 feature gate
 }
 
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
@@ -842,6 +847,32 @@ pub struct Expr {
     pub node: ExprKind,
     pub span: Span,
     pub attrs: ThinVec<Attribute>
+}
+
+impl Expr {
+    /// Wether this expression would be valid somewhere that expects a value, for example, an `if`
+    /// condition.
+    pub fn returns(&self) -> bool {
+        if let ExprKind::Block(ref block) = self.node {
+            match block.stmts.last().map(|last_stmt| &last_stmt.node) {
+                // implicit return
+                Some(&StmtKind::Expr(_)) => true,
+                Some(&StmtKind::Semi(ref expr)) => {
+                    if let ExprKind::Ret(_) = expr.node {
+                        // last statement is explicit return
+                        true
+                    } else {
+                        false
+                    }
+                }
+                // This is a block that doesn't end in either an implicit or explicit return
+                _ => false,
+            }
+        } else {
+            // This is not a block, it is a value
+            true
+        }
+    }
 }
 
 impl fmt::Debug for Expr {
@@ -990,6 +1021,9 @@ pub enum ExprKind {
 
     /// `expr?`
     Try(P<Expr>),
+
+    /// A `yield`, with an optional value to be yielded
+    Yield(Option<P<Expr>>),
 }
 
 /// The explicit Self type in a "qualified path". The actual
@@ -1144,7 +1178,6 @@ pub struct MethodSig {
     pub constness: Spanned<Constness>,
     pub abi: Abi,
     pub decl: P<FnDecl>,
-    pub generics: Generics,
 }
 
 /// Represents an item declaration within a trait declaration,
@@ -1156,6 +1189,7 @@ pub struct TraitItem {
     pub id: NodeId,
     pub ident: Ident,
     pub attrs: Vec<Attribute>,
+    pub generics: Generics,
     pub node: TraitItemKind,
     pub span: Span,
     /// See `Item::tokens` for what this is
@@ -1177,6 +1211,7 @@ pub struct ImplItem {
     pub vis: Visibility,
     pub defaultness: Defaultness,
     pub attrs: Vec<Attribute>,
+    pub generics: Generics,
     pub node: ImplItemKind,
     pub span: Span,
     /// See `Item::tokens` for what this is
@@ -1191,7 +1226,8 @@ pub enum ImplItemKind {
     Macro(Mac),
 }
 
-#[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Copy)]
+#[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Copy,
+         PartialOrd, Ord)]
 pub enum IntTy {
     Is,
     I8,
@@ -1244,7 +1280,8 @@ impl IntTy {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Copy)]
+#[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Copy,
+         PartialOrd, Ord)]
 pub enum UintTy {
     Us,
     U8,
@@ -1294,7 +1331,8 @@ impl fmt::Display for UintTy {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Copy)]
+#[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Copy,
+         PartialOrd, Ord)]
 pub enum FloatTy {
     F32,
     F64,
@@ -1382,7 +1420,7 @@ pub enum TyKind {
     Path(Option<QSelf>, Path),
     /// A trait object type `Bound1 + Bound2 + Bound3`
     /// where `Bound` is a trait or a lifetime.
-    TraitObject(TyParamBounds),
+    TraitObject(TyParamBounds, TraitObjectSyntax),
     /// An `impl Bound1 + Bound2 + Bound3` type
     /// where `Bound` is a trait or a lifetime.
     ImplTrait(TyParamBounds),
@@ -1399,6 +1437,13 @@ pub enum TyKind {
     Mac(Mac),
     /// Placeholder for a kind that has failed to be defined.
     Err,
+}
+
+/// Syntax used to declare a trait object.
+#[derive(Clone, Copy, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
+pub enum TraitObjectSyntax {
+    Dyn,
+    None,
 }
 
 /// Inline assembly dialect.
@@ -1492,15 +1537,15 @@ impl Arg {
         let infer_ty = P(Ty {
             id: DUMMY_NODE_ID,
             node: TyKind::ImplicitSelf,
-            span: span,
+            span,
         });
         let arg = |mutbl, ty| Arg {
             pat: P(Pat {
                 id: DUMMY_NODE_ID,
                 node: PatKind::Ident(BindingMode::ByValue(mutbl), eself_ident, None),
-                span: span,
+                span,
             }),
-            ty: ty,
+            ty,
             id: DUMMY_NODE_ID,
         };
         match eself.node {
@@ -1509,7 +1554,7 @@ impl Arg {
             SelfKind::Region(lt, mutbl) => arg(Mutability::Immutable, P(Ty {
                 id: DUMMY_NODE_ID,
                 node: TyKind::Rptr(lt, MutTy { ty: infer_ty, mutbl: mutbl }),
-                span: span,
+                span,
             })),
         }
     }
@@ -1738,15 +1783,24 @@ impl PolyTraitRef {
         PolyTraitRef {
             bound_lifetimes: lifetimes,
             trait_ref: TraitRef { path: path, ref_id: DUMMY_NODE_ID },
-            span: span,
+            span,
         }
     }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
+pub enum CrateSugar {
+    /// Source is `pub(crate)`
+    PubCrate,
+
+    /// Source is (just) `crate`
+    JustCrate,
 }
 
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
 pub enum Visibility {
     Public,
-    Crate(Span),
+    Crate(Span, CrateSugar),
     Restricted { path: P<Path>, id: NodeId },
     Inherited,
 }
@@ -1838,7 +1892,7 @@ pub struct Item {
 
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
 pub enum ItemKind {
-    /// An`extern crate` item, with optional original crate name.
+    /// An `extern crate` item, with optional original crate name.
     ///
     /// E.g. `extern crate foo` or `extern crate foo_bar as foo`
     ExternCrate(Option<Name>),
@@ -1888,7 +1942,7 @@ pub enum ItemKind {
     ///
     /// E.g. `trait Foo { .. }` or `trait Foo<T> { .. }`
     Trait(Unsafety, Generics, TyParamBounds, Vec<TraitItem>),
-    // Default trait implementation.
+    /// Auto trait implementation.
     ///
     /// E.g. `impl Trait for .. {}` or `impl<T> Trait<T> for .. {}`
     DefaultImpl(Unsafety, TraitRef),

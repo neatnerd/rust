@@ -14,6 +14,7 @@
 
 #![deny(warnings)]
 
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 extern crate libc;
 extern crate test;
 extern crate getopts;
@@ -39,7 +40,6 @@ use util::logv;
 
 use self::header::EarlyProps;
 
-pub mod procsrv;
 pub mod util;
 mod json;
 pub mod header;
@@ -102,6 +102,8 @@ pub fn parse_config(args: Vec<String> ) -> Config {
         .reqopt("", "cc", "path to a C compiler", "PATH")
         .reqopt("", "cxx", "path to a C++ compiler", "PATH")
         .reqopt("", "cflags", "flags for the C compiler", "FLAGS")
+        .optopt("", "ar", "path to an archiver", "PATH")
+        .optopt("", "linker", "path to a linker", "PATH")
         .reqopt("", "llvm-components", "list of LLVM components built in", "LIST")
         .reqopt("", "llvm-cxxflags", "C++ flags for LLVM", "FLAGS")
         .optopt("", "nodejs", "the name of nodejs", "PATH")
@@ -176,9 +178,9 @@ pub fn parse_config(args: Vec<String> ) -> Config {
         target_rustcflags: matches.opt_str("target-rustcflags"),
         target: opt_str2(matches.opt_str("target")),
         host: opt_str2(matches.opt_str("host")),
-        gdb: gdb,
-        gdb_version: gdb_version,
-        gdb_native_rust: gdb_native_rust,
+        gdb,
+        gdb_version,
+        gdb_native_rust,
         lldb_version: extract_lldb_version(matches.opt_str("lldb-version")),
         llvm_version: matches.opt_str("llvm-version"),
         system_llvm: matches.opt_present("system-llvm"),
@@ -192,12 +194,14 @@ pub fn parse_config(args: Vec<String> ) -> Config {
         lldb_python_dir: matches.opt_str("lldb-python-dir"),
         verbose: matches.opt_present("verbose"),
         quiet: matches.opt_present("quiet"),
-        color: color,
+        color,
         remote_test_client: matches.opt_str("remote-test-client").map(PathBuf::from),
 
         cc: matches.opt_str("cc").unwrap(),
         cxx: matches.opt_str("cxx").unwrap(),
         cflags: matches.opt_str("cflags").unwrap(),
+        ar: matches.opt_str("ar").unwrap_or("ar".into()),
+        linker: matches.opt_str("linker"),
         llvm_components: matches.opt_str("llvm-components").unwrap(),
         llvm_cxxflags: matches.opt_str("llvm-cxxflags").unwrap(),
         nodejs: matches.opt_str("nodejs"),
@@ -234,6 +238,8 @@ pub fn log_config(config: &Config) {
     logv(c, format!("adb_test_dir: {:?}", config.adb_test_dir));
     logv(c, format!("adb_device_status: {}",
                     config.adb_device_status));
+    logv(c, format!("ar: {}", config.ar));
+    logv(c, format!("linker: {:?}", config.linker));
     logv(c, format!("verbose: {}", config.verbose));
     logv(c, format!("quiet: {}", config.quiet));
     logv(c, "\n".to_string());
@@ -470,8 +476,8 @@ pub fn make_test(config: &Config, testpaths: &TestPaths) -> test::TestDescAndFn 
     test::TestDescAndFn {
         desc: test::TestDesc {
             name: make_test_name(config, testpaths),
-            ignore: ignore,
-            should_panic: should_panic,
+            ignore,
+            should_panic,
             allow_fail: false,
         },
         testfn: make_test_closure(config, testpaths),
@@ -489,15 +495,28 @@ fn stamp(config: &Config, testpaths: &TestPaths) -> PathBuf {
 }
 
 fn up_to_date(config: &Config, testpaths: &TestPaths, props: &EarlyProps) -> bool {
+    let rust_src_dir = config.find_rust_src_root().expect(
+        "Could not find Rust source root",
+    );
     let stamp = mtime(&stamp(config, testpaths));
-    let mut inputs = vec![
-        mtime(&testpaths.file),
-        mtime(&config.rustc_path),
-    ];
+    let mut inputs = vec![mtime(&testpaths.file), mtime(&config.rustc_path)];
     for aux in props.aux.iter() {
-        inputs.push(mtime(&testpaths.file.parent().unwrap()
-                                         .join("auxiliary")
-                                         .join(aux)));
+        inputs.push(mtime(
+            &testpaths.file.parent().unwrap().join("auxiliary").join(
+                aux,
+            ),
+        ));
+    }
+    // Relevant pretty printer files
+    let pretty_printer_files = [
+        "src/etc/debugger_pretty_printers_common.py",
+        "src/etc/gdb_load_rust_pretty_printers.py",
+        "src/etc/gdb_rust_pretty_printing.py",
+        "src/etc/lldb_batchmode.py",
+        "src/etc/lldb_rust_formatters.py",
+    ];
+    for pretty_printer_file in &pretty_printer_files {
+        inputs.push(mtime(&rust_src_dir.join(pretty_printer_file)));
     }
     for lib in config.run_lib_path.read_dir().unwrap() {
         let lib = lib.unwrap();
@@ -517,7 +536,7 @@ pub fn make_test_name(config: &Config, testpaths: &TestPaths) -> test::TestName 
     //
     //    run-pass/foo/bar/baz.rs
     let path =
-        PathBuf::from(config.mode.to_string())
+        PathBuf::from(config.src_base.file_name().unwrap())
         .join(&testpaths.relative_dir)
         .join(&testpaths.file.file_name().unwrap());
     test::DynTestName(format!("[{}] {}", config.mode, path.display()))

@@ -16,8 +16,7 @@
 // non-ASCII characters.  The child process ensures all the strings are
 // intact.
 
-// ignore-aarch64
-// ignore-emscripten
+// ignore-emscripten no processes
 
 use std::io::prelude::*;
 use std::io;

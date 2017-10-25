@@ -23,7 +23,12 @@ use std::cmp;
 use std::fmt;
 use std::i64;
 use std::iter;
+use std::mem;
 use std::ops::Deref;
+
+use ich::StableHashingContext;
+use rustc_data_structures::stable_hasher::{HashStable, StableHasher,
+                                           StableHasherResult};
 
 /// Parsed [Data layout](http://llvm.org/docs/LangRef.html#data-layout)
 /// for a target, which contains everything needed to compute layouts.
@@ -386,7 +391,7 @@ impl Integer {
         }
     }
 
-    pub fn to_ty<'a, 'tcx>(&self, tcx: &ty::TyCtxt<'a, 'tcx, 'tcx>,
+    pub fn to_ty<'a, 'tcx>(&self, tcx: &TyCtxt<'a, 'tcx, 'tcx>,
                            signed: bool) -> Ty<'tcx> {
         match (*self, signed) {
             (I1, false) => tcx.types.u8,
@@ -581,14 +586,14 @@ pub struct Struct {
     pub min_size: Size,
 }
 
-// Info required to optimize struct layout.
+/// Info required to optimize struct layout.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug)]
 enum StructKind {
-    // A tuple, closure, or univariant which cannot be coerced to unsized.
+    /// A tuple, closure, or univariant which cannot be coerced to unsized.
     AlwaysSizedUnivariant,
-    // A univariant, the last field of which may be coerced to unsized.
+    /// A univariant, the last field of which may be coerced to unsized.
     MaybeUnsizedUnivariant,
-    // A univariant, but part of an enum.
+    /// A univariant, but part of an enum.
     EnumVariant,
 }
 
@@ -837,12 +842,22 @@ impl<'a, 'tcx> Struct {
 
             // Is this a fixed-size array of something non-zero
             // with at least one element?
-            (_, &ty::TyArray(ety, d)) if d > 0 => {
-                Struct::non_zero_field_paths(
-                    tcx,
-                    param_env,
-                    Some(ety).into_iter(),
-                    None)
+            (_, &ty::TyArray(ety, mut count)) => {
+                if count.has_projections() {
+                    count = tcx.normalize_associated_type_in_env(&count, param_env);
+                    if count.has_projections() {
+                        return Err(LayoutError::Unknown(ty));
+                    }
+                }
+                if count.val.to_const_int().unwrap().to_u64().unwrap() != 0 {
+                    Struct::non_zero_field_paths(
+                        tcx,
+                        param_env,
+                        Some(ety).into_iter(),
+                        None)
+                } else {
+                    Ok(None)
+                }
             }
 
             (_, &ty::TyProjection(_)) | (_, &ty::TyAnon(..)) => {
@@ -1020,7 +1035,7 @@ pub enum Layout {
     /// TyRawPtr or TyRef with a !Sized pointee.
     FatPointer {
         metadata: Primitive,
-        // If true, the pointer cannot be null.
+        /// If true, the pointer cannot be null.
         non_zero: bool
     },
 
@@ -1031,8 +1046,8 @@ pub enum Layout {
         discr: Integer,
         signed: bool,
         non_zero: bool,
-        // Inclusive discriminant range.
-        // If min > max, it represents min...u64::MAX followed by 0...max.
+        /// Inclusive discriminant range.
+        /// If min > max, it represents min...u64::MAX followed by 0...max.
         // FIXME(eddyb) always use the shortest range, e.g. by finding
         // the largest space between two consecutive discriminants and
         // taking everything else as the (shortest) discriminant range.
@@ -1043,7 +1058,7 @@ pub enum Layout {
     /// Single-case enums, and structs/tuples.
     Univariant {
         variant: Struct,
-        // If true, the structure is NonZero.
+        /// If true, the structure is NonZero.
         // FIXME(eddyb) use a newtype Layout kind for this.
         non_zero: bool
     },
@@ -1084,9 +1099,9 @@ pub enum Layout {
     StructWrappedNullablePointer {
         nndiscr: u64,
         nonnull: Struct,
-        // N.B. There is a 0 at the start, for LLVM GEP through a pointer.
+        /// N.B. There is a 0 at the start, for LLVM GEP through a pointer.
         discrfield: FieldPath,
-        // Like discrfield, but in source order. For debuginfo.
+        /// Like discrfield, but in source order. For debuginfo.
         discrfield_source: FieldPath
     }
 }
@@ -1174,12 +1189,17 @@ impl<'a, 'tcx> Layout {
             }
 
             // Arrays and slices.
-            ty::TyArray(element, count) => {
+            ty::TyArray(element, mut count) => {
+                if count.has_projections() {
+                    count = tcx.normalize_associated_type_in_env(&count, param_env);
+                    if count.has_projections() {
+                        return Err(LayoutError::Unknown(ty));
+                    }
+                }
+
                 let element = element.layout(tcx, param_env)?;
                 let element_size = element.size(dl);
-                // FIXME(eddyb) Don't use host `usize` for array lengths.
-                let usize_count: usize = count;
-                let count = usize_count as u64;
+                let count = count.val.to_const_int().unwrap().to_u64().unwrap();
                 if element_size.checked_mul(count, dl).is_none() {
                     return Err(LayoutError::SizeOverflow(ty));
                 }
@@ -1226,7 +1246,17 @@ impl<'a, 'tcx> Layout {
                 Univariant { variant: unit, non_zero: false }
             }
 
-            // Tuples and closures.
+            // Tuples, generators and closures.
+            ty::TyGenerator(def_id, ref substs, _) => {
+                let tys = substs.field_tys(def_id, tcx);
+                let st = Struct::new(dl,
+                    &tys.map(|ty| ty.layout(tcx, param_env))
+                      .collect::<Result<Vec<_>, _>>()?,
+                    &ReprOptions::default(),
+                    StructKind::AlwaysSizedUnivariant, ty)?;
+                Univariant { variant: st, non_zero: false }
+            }
+
             ty::TyClosure(def_id, ref substs) => {
                 let tys = substs.upvar_tys(def_id, tcx);
                 let st = Struct::new(dl,
@@ -1334,7 +1364,7 @@ impl<'a, 'tcx> Layout {
                     } else {
                         let st = Struct::new(dl, &fields, &def.repr,
                           kind, ty)?;
-                        let non_zero = Some(def.did) == tcx.lang_items.non_zero();
+                        let non_zero = Some(def.did) == tcx.lang_items().non_zero();
                         Univariant { variant: st, non_zero: non_zero }
                     };
                     return success(layout);
@@ -1944,11 +1974,11 @@ pub enum SizeSkeleton<'tcx> {
 
     /// A potentially-fat pointer.
     Pointer {
-        // If true, this pointer is never null.
+        /// If true, this pointer is never null.
         non_zero: bool,
-        // The type which determines the unsized metadata, if any,
-        // of this pointer. Either a type parameter or a projection
-        // depending on one, with regions erased.
+        /// The type which determines the unsized metadata, if any,
+        /// of this pointer. Either a type parameter or a projection
+        /// depending on one, with regions erased.
         tail: Ty<'tcx>
     }
 }
@@ -2033,7 +2063,7 @@ impl<'a, 'tcx> SizeSkeleton<'tcx> {
                     if let Some(SizeSkeleton::Pointer { non_zero, tail }) = v0 {
                         return Ok(SizeSkeleton::Pointer {
                             non_zero: non_zero ||
-                                Some(def.did) == tcx.lang_items.non_zero(),
+                                Some(def.did) == tcx.lang_items().non_zero(),
                             tail,
                         });
                     } else {
@@ -2197,8 +2227,8 @@ impl<'a, 'tcx> TyLayout<'tcx> {
         let tcx = cx.tcx();
 
         let ptr_field_type = |pointee: Ty<'tcx>| {
+            assert!(i < 2);
             let slice = |element: Ty<'tcx>| {
-                assert!(i < 2);
                 if i == 0 {
                     tcx.mk_mut_ptr(element)
                 } else {
@@ -2240,9 +2270,13 @@ impl<'a, 'tcx> TyLayout<'tcx> {
             ty::TySlice(element) => element,
             ty::TyStr => tcx.types.u8,
 
-            // Tuples and closures.
+            // Tuples, generators and closures.
             ty::TyClosure(def_id, ref substs) => {
                 substs.upvar_tys(def_id, tcx).nth(i).unwrap()
+            }
+
+            ty::TyGenerator(def_id, ref substs, _) => {
+                substs.field_tys(def_id, tcx).nth(i).unwrap()
             }
 
             ty::TyTuple(tys, _) => tys[i],
@@ -2271,3 +2305,128 @@ impl<'a, 'tcx> TyLayout<'tcx> {
         cx.layout_of(cx.normalize_projections(self.field_type(cx, i)))
     }
 }
+
+impl<'gcx> HashStable<StableHashingContext<'gcx>> for Layout
+{
+    fn hash_stable<W: StableHasherResult>(&self,
+                                          hcx: &mut StableHashingContext<'gcx>,
+                                          hasher: &mut StableHasher<W>) {
+        use ty::layout::Layout::*;
+        mem::discriminant(self).hash_stable(hcx, hasher);
+
+        match *self {
+            Scalar { value, non_zero } => {
+                value.hash_stable(hcx, hasher);
+                non_zero.hash_stable(hcx, hasher);
+            }
+            Vector { element, count } => {
+                element.hash_stable(hcx, hasher);
+                count.hash_stable(hcx, hasher);
+            }
+            Array { sized, align, primitive_align, element_size, count } => {
+                sized.hash_stable(hcx, hasher);
+                align.hash_stable(hcx, hasher);
+                primitive_align.hash_stable(hcx, hasher);
+                element_size.hash_stable(hcx, hasher);
+                count.hash_stable(hcx, hasher);
+            }
+            FatPointer { ref metadata, non_zero } => {
+                metadata.hash_stable(hcx, hasher);
+                non_zero.hash_stable(hcx, hasher);
+            }
+            CEnum { discr, signed, non_zero, min, max } => {
+                discr.hash_stable(hcx, hasher);
+                signed.hash_stable(hcx, hasher);
+                non_zero.hash_stable(hcx, hasher);
+                min.hash_stable(hcx, hasher);
+                max.hash_stable(hcx, hasher);
+            }
+            Univariant { ref variant, non_zero } => {
+                variant.hash_stable(hcx, hasher);
+                non_zero.hash_stable(hcx, hasher);
+            }
+            UntaggedUnion { ref variants } => {
+                variants.hash_stable(hcx, hasher);
+            }
+            General { discr, ref variants, size, align, primitive_align } => {
+                discr.hash_stable(hcx, hasher);
+                variants.hash_stable(hcx, hasher);
+                size.hash_stable(hcx, hasher);
+                align.hash_stable(hcx, hasher);
+                primitive_align.hash_stable(hcx, hasher);
+            }
+            RawNullablePointer { nndiscr, ref value } => {
+                nndiscr.hash_stable(hcx, hasher);
+                value.hash_stable(hcx, hasher);
+            }
+            StructWrappedNullablePointer {
+                nndiscr,
+                ref nonnull,
+                ref discrfield,
+                ref discrfield_source
+            } => {
+                nndiscr.hash_stable(hcx, hasher);
+                nonnull.hash_stable(hcx, hasher);
+                discrfield.hash_stable(hcx, hasher);
+                discrfield_source.hash_stable(hcx, hasher);
+            }
+        }
+    }
+}
+
+impl_stable_hash_for!(enum ::ty::layout::Integer {
+    I1,
+    I8,
+    I16,
+    I32,
+    I64,
+    I128
+});
+
+impl_stable_hash_for!(enum ::ty::layout::Primitive {
+    Int(integer),
+    F32,
+    F64,
+    Pointer
+});
+
+impl_stable_hash_for!(struct ::ty::layout::Align {
+    abi,
+    pref
+});
+
+impl_stable_hash_for!(struct ::ty::layout::Size {
+    raw
+});
+
+impl<'gcx> HashStable<StableHashingContext<'gcx>> for LayoutError<'gcx>
+{
+    fn hash_stable<W: StableHasherResult>(&self,
+                                          hcx: &mut StableHashingContext<'gcx>,
+                                          hasher: &mut StableHasher<W>) {
+        use ty::layout::LayoutError::*;
+        mem::discriminant(self).hash_stable(hcx, hasher);
+
+        match *self {
+            Unknown(t) |
+            SizeOverflow(t) => t.hash_stable(hcx, hasher)
+        }
+    }
+}
+
+impl_stable_hash_for!(struct ::ty::layout::Struct {
+    align,
+    primitive_align,
+    packed,
+    sized,
+    offsets,
+    memory_index,
+    min_size
+});
+
+impl_stable_hash_for!(struct ::ty::layout::Union {
+    align,
+    primitive_align,
+    min_size,
+    packed
+});

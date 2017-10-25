@@ -80,7 +80,7 @@ impl<'a, T: 'a + fmt::Debug> fmt::Debug for Iter<'a, T> {
     }
 }
 
-// FIXME #19839: deriving is too aggressive on the bounds (T doesn't need to be Clone).
+// FIXME(#26925) Remove in favor of `#[derive(Clone)]`
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<'a, T> Clone for Iter<'a, T> {
     fn clone(&self) -> Self {
@@ -140,7 +140,7 @@ impl<T> Node<T> {
         Node {
             next: None,
             prev: None,
-            element: element,
+            element,
         }
     }
 
@@ -924,7 +924,7 @@ impl<'a, T> IterMut<'a, T> {
                 let node = Some(Shared::from(Box::into_unique(box Node {
                     next: Some(head),
                     prev: Some(prev),
-                    element: element,
+                    element,
                 })));
 
                 prev.as_mut().next = node;

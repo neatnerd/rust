@@ -9,7 +9,6 @@
 // except according to those terms.
 
 use llvm::ValueRef;
-use rustc::traits;
 use callee;
 use common::*;
 use builder::Builder;
@@ -18,7 +17,7 @@ use machine;
 use monomorphize;
 use type_::Type;
 use value::Value;
-use rustc::ty;
+use rustc::ty::{self, Ty};
 
 #[derive(Copy, Clone, Debug)]
 pub struct VirtualIndex(usize);
@@ -46,7 +45,7 @@ impl<'a, 'tcx> VirtualIndex {
         // Load the data pointer from the object.
         debug!("get_int({:?}, {:?})", Value(llvtable), self);
 
-        let llvtable = bcx.pointercast(llvtable, Type::int(bcx.ccx).ptr_to());
+        let llvtable = bcx.pointercast(llvtable, Type::isize(bcx.ccx).ptr_to());
         let ptr = bcx.load(bcx.gepi(llvtable, &[self.0]), None);
         // Vtable loads are invariant
         bcx.set_invariant_load(ptr);
@@ -63,7 +62,7 @@ impl<'a, 'tcx> VirtualIndex {
 /// making an object `Foo<Trait>` from a value of type `Foo<T>`, then
 /// `trait_ref` would map `T:Trait`.
 pub fn get_vtable<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>,
-                            ty: ty::Ty<'tcx>,
+                            ty: Ty<'tcx>,
                             trait_ref: Option<ty::PolyExistentialTraitRef<'tcx>>)
                             -> ValueRef
 {
@@ -80,14 +79,15 @@ pub fn get_vtable<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>,
     let nullptr = C_null(Type::nil(ccx).ptr_to());
 
     let mut components: Vec<_> = [
-        callee::get_fn(ccx, monomorphize::resolve_drop_in_place(ccx.shared(), ty)),
-        C_uint(ccx, ccx.size_of(ty)),
-        C_uint(ccx, ccx.align_of(ty))
+        callee::get_fn(ccx, monomorphize::resolve_drop_in_place(ccx.tcx(), ty)),
+        C_usize(ccx, ccx.size_of(ty)),
+        C_usize(ccx, ccx.align_of(ty) as u64)
     ].iter().cloned().collect();
 
     if let Some(trait_ref) = trait_ref {
         let trait_ref = trait_ref.with_self_ty(tcx, ty);
-        let methods = traits::get_vtable_methods(tcx, trait_ref).map(|opt_mth| {
+        let methods = tcx.vtable_methods(trait_ref);
+        let methods = methods.iter().cloned().map(|opt_mth| {
             opt_mth.map_or(nullptr, |(def_id, substs)| {
                 callee::resolve_and_get_fn(ccx, def_id, substs)
             })
